@@ -16,6 +16,8 @@ def execute_command(args):
             pass
         case 'HELP':
             print_commands()
+        case 'EXIT' | 'QUIT':
+            exit();
         case _:
             print(f'*** Unkown syntax {" ".join(args)}')
 
