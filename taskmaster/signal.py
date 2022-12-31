@@ -4,7 +4,7 @@ def handler(signum, frame):
     match signum:
         case signal.SIGINT:
             print("\b\b  ")
-            exit()
+            exit(130)
         case signal.SIGQUIT:
             print("\b\bQuit")
             exit(131)

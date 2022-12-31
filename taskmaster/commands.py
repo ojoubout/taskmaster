@@ -1,5 +1,7 @@
 import signal
 
+from taskmaster.error import error
+
 
 def execute_command(args):
     cmd = args[0]
@@ -19,7 +21,7 @@ def execute_command(args):
         case 'EXIT' | 'QUIT':
             exit();
         case _:
-            print(f'*** Unkown syntax {" ".join(args)}')
+            error(f'*** Unkown syntax {" ".join(args)}')
 
 def print_commands():
     print('commands: start, stop, restart, reload, exit, quit')
