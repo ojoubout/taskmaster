@@ -1,1 +1,2 @@
-processes = []
+class Config:
+    programs = {}

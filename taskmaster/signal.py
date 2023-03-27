@@ -12,5 +12,5 @@ def handler(signum, frame):
             exit(1)
 
 def handle_signals():
-    signal.signal(signal.SIGINT, handler);
-    signal.signal(signal.SIGQUIT, handler);
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGQUIT, handler)
