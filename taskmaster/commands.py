@@ -23,8 +23,10 @@ def execute_command(args):
         case _:
             error(f'*** Unkown syntax {" ".join(args)}')
 
+
 def print_commands():
     print('commands: start, stop, restart, reload, exit, quit')
+
 
 def prompt():
     try:

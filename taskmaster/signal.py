@@ -1,5 +1,6 @@
 import signal
 
+
 def handler(signum, frame):
     match signum:
         case signal.SIGINT:
@@ -10,6 +11,7 @@ def handler(signum, frame):
             exit(131)
         case _:
             exit(1)
+
 
 def handle_signals():
     signal.signal(signal.SIGINT, handler)

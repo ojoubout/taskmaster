@@ -3,17 +3,19 @@ from taskmaster.error import error
 from taskmaster.config import Config
 from taskmaster.program import Program
 
+
 def parse_config_file() -> Config:
     conf = Config()
     try:
         with open('taskmaster.conf') as stream:
             config_file = yaml.safe_load(stream)
             conf.programs = extract_programs(config_file)
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         error('config file not found')
     except yaml.YAMLError as exc:
-        error("can't parse config file: {exc}")
+        error(f"can't parse config file: {exc}")
     return conf
+
 
 def extract_programs(config) -> dict:
     programs = {}
@@ -25,4 +27,3 @@ def extract_programs(config) -> dict:
         program = Program(**value)
         programs[key] = program
     return programs
-        
