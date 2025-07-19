@@ -68,7 +68,6 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	return &cfg, nil
-
 }
 
 func validateProgram(name string, p Program) error {

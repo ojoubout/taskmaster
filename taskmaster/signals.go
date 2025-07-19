@@ -8,7 +8,6 @@ import (
 )
 
 func onSIGHUP(cfg *Config) {
-	fmt.Println("fwefwefwefew", cfg)
 	new_cfg, err := LoadConfig("taskmaster.conf")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error re-loading config:", err)

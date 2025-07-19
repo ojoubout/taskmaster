@@ -19,8 +19,12 @@ func main() {
 	}
 	taskmaster.SigNotifier(cfg)
 
-	fmt.Println("Process is running. PID:", os.Getpid())
-	fmt.Println("Send SIGHUP with: kill -SIGHUP", os.Getpid())
+	// programs := make(map[string]map[int]*exec.Cmd)
 
+	supervisor := taskmaster.NewSupervisor(cfg)
+
+	taskmaster.RunInitialState(supervisor)
+
+	fmt.Println("Taskmaster is running. PID:", os.Getpid())
 	select {}
 }
