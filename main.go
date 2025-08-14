@@ -17,14 +17,17 @@ func main() {
 	for name, prog := range cfg.Programs {
 		fmt.Printf("Program: %s, Command: %s, NumProcs: %d, ExitCodes: %v\n", name, prog.Command, prog.NumProcs, prog.ExitCodes)
 	}
-	taskmaster.SigNotifier(cfg)
-
-	// programs := make(map[string]map[int]*exec.Cmd)
-
+	
+	// Start supervisor
 	supervisor := taskmaster.NewSupervisor(cfg)
-
 	taskmaster.RunInitialState(supervisor)
+	
+	// Set up signal handling for SIGHUP reload
+	go taskmaster.SigNotifier(cfg)
 
 	fmt.Println("Taskmaster is running. PID:", os.Getpid())
-	select {}
+	
+	// Start control shell
+	shell := taskmaster.NewShell(supervisor)
+	shell.Start()
 }

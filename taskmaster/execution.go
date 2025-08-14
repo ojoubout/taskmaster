@@ -17,6 +17,7 @@ type Supervisor struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+	mu       sync.RWMutex
 }
 
 func NewSupervisor(cfg *Config) *Supervisor {
@@ -53,7 +54,6 @@ func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd)
 				stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err == nil {
 					cmd.Stdout = stdoutFile
-					defer stdoutFile.Close()
 				} else {
 					fmt.Printf("failed to open stdout file %s: %v\n", programConfig.Stdout, err)
 				}
@@ -63,7 +63,6 @@ func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd)
 				stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err == nil {
 					cmd.Stderr = stderrFile
-					defer stderrFile.Close()
 				} else {
 					fmt.Printf("failed to open stderr file %s: %v\n", programConfig.Stderr, err)
 				}
@@ -165,33 +164,142 @@ func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd)
 			}
 		}
 	}()
-	fmt.Println(programConfig)
+	
+	// This approach was flawed - we need to return the actual PID and cmd
+	// Let me rewrite this function completely
 	return 0, nil
 }
 
-func StartProgram(program *map[int]*exec.Cmd, spv *Supervisor, programConfig *Program) {
+func startSingleWorkerNew(programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
+	parts := strings.Fields(programConfig.Command)
+	cmd := exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
+
+	if programConfig.Directory != "" {
+		cmd.Dir = programConfig.Directory
+	}
+
+	// Set environment variables
+	env := os.Environ()
+	for k, v := range programConfig.Env {
+		env = append(env, k+"="+v)
+	}
+	cmd.Env = env
+
+	// Set up stdout redirection
+	if programConfig.Stdout != "" {
+		stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Printf("Failed to open stdout file %s: %v\n", programConfig.Stdout, err)
+		} else {
+			cmd.Stdout = stdoutFile
+		}
+	}
+
+	// Set up stderr redirection
+	if programConfig.Stderr != "" {
+		stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Printf("Failed to open stderr file %s: %v\n", programConfig.Stderr, err)
+		} else {
+			cmd.Stderr = stderrFile
+		}
+	}
+
+	// Set umask
+	var oldUmask int
+	if programConfig.Umask != 0 {
+		oldUmask = syscall.Umask(programConfig.Umask)
+		defer syscall.Umask(oldUmask)
+	}
+
+	fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
+	
+	// Start the process
+	err := cmd.Start()
+	if err != nil {
+		fmt.Printf("[taskmaster] Failed to start %s: %v\n", programConfig.Command, err)
+		return 0, nil
+	}
+
+	pid := cmd.Process.Pid
+	fmt.Printf("[taskmaster] Started %s with PID %d\n", programConfig.Command, pid)
+
+	// Function to close file handles
+	closeFiles := func() {
+		if cmd.Stdout != nil {
+			if file, ok := cmd.Stdout.(*os.File); ok {
+				file.Close()
+			}
+		}
+		if cmd.Stderr != nil {
+			if file, ok := cmd.Stderr.(*os.File); ok {
+				file.Close()
+			}
+		}
+	}
+
+	// Start monitoring goroutine
+	spv.wg.Add(1)
+	go func() {
+		defer spv.wg.Done()
+		defer closeFiles()
+
+		// Wait for startsecs validation if needed
+		if programConfig.StartSecs > 0 {
+			// Use a timer to check if process survives startsecs
+			timer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
+			defer timer.Stop()
+			
+			select {
+			case <-spv.ctx.Done():
+				return
+			case <-timer.C:
+				fmt.Printf("[taskmaster] Process %d survived startsecs, now monitoring\n", pid)
+			}
+		}
+
+		// Monitor the process until it exits
+		err = cmd.Wait()
+		if err != nil {
+			fmt.Printf("[taskmaster] Process %d exited with error: %v\n", pid, err)
+		} else {
+			fmt.Printf("[taskmaster] Process %d exited successfully\n", pid)
+		}
+
+		// TODO: Handle restart logic based on autorestart policy
+	}()
+
+	return pid, cmd
+}
+
+func (spv *Supervisor) StartProgram(programName string, programConfig *Program) {
+	if spv.programs[programName] == nil {
+		spv.programs[programName] = make(map[int]*exec.Cmd)
+	}
+	
 	for i := 0; i < programConfig.NumProcs; i++ {
-		pid, cmd := startSingleWorker(programConfig, spv)
-		(*program)[pid] = cmd
+		pid, cmd := startSingleWorkerNew(programConfig, spv)
+		if cmd != nil {
+			spv.programs[programName][i] = cmd
+			fmt.Printf("[taskmaster] Stored process %d for program %s (instance %d)\n", pid, programName, i)
+		}
 	}
 }
 
 func RunInitialState(spv *Supervisor) {
+	spv.mu.Lock()
+	defer spv.mu.Unlock()
+	
 	for name, programConfig := range spv.cfg.Programs {
 		if !programConfig.Autostart {
 			continue
 		}
-		if spv.programs[name] == nil {
-			spv.programs[name] = map[int]*exec.Cmd{}
-		}
-		prog := spv.programs[name]
-		StartProgram(&prog, spv, &programConfig)
-		spv.programs[name] = prog
+		spv.StartProgram(name, &programConfig)
 	}
 }
 
 // StopProcess sends the stopsignal to the process, waits for stopwaitsecs, and force kills if not exited.
-func StopProcess(cmd *exec.Cmd, programConfig *Program) error {
+func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programConfig *Program) error {
 	if cmd == nil || cmd.Process == nil {
 		return fmt.Errorf("process not running")
 	}
