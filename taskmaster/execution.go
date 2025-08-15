@@ -36,155 +36,10 @@ func NewSupervisor(cfg *Config) *Supervisor {
 	}
 }
 
-func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
-	spv.wg.Add(1)
-	go func() {
-		defer spv.wg.Done()
-		retries := 0
-		var err error
-		for {
-			select {
-			case <-spv.ctx.Done():
-				return
-			default:
-			}
-			parts := strings.Fields(programConfig.Command)
-			cmd := exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
-
-			if programConfig.Directory != "" {
-				cmd.Dir = programConfig.Directory
-			}
-
-			env := os.Environ()
-			for k, v := range programConfig.Env {
-				env = append(env, k+"="+v)
-			}
-			cmd.Env = env
-
-			if programConfig.Stdout != "" {
-				stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-				if err == nil {
-					cmd.Stdout = stdoutFile
-				} else {
-					fmt.Printf("failed to open stdout file %s: %v\n", programConfig.Stdout, err)
-				}
-			}
-
-			if programConfig.Stderr != "" {
-				stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-				if err == nil {
-					cmd.Stderr = stderrFile
-				} else {
-					fmt.Printf("failed to open stderr file %s: %v\n", programConfig.Stderr, err)
-				}
-			}
-
-			var oldUmask int
-			if programConfig.Umask != 0 {
-				oldUmask = syscall.Umask(programConfig.Umask)
-				defer syscall.Umask(oldUmask)
-			}
-
-			fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
-			startTime := make(chan error, 1)
-			go func() {
-				err = cmd.Start()
-				startTime <- err
-			}()
-
-			err = <-startTime
-			if err != nil {
-				fmt.Printf("[taskmaster] Failed to start %s: %v\n", programConfig.Command, err)
-				retries++
-				if retries > programConfig.StartRetries {
-					fmt.Printf("[taskmaster] Aborting after %d retries: %s\n", retries-1, programConfig.Command)
-					return
-				}
-				continue
-			}
-
-			// Wait for startsecs to consider process successfully started
-			if programConfig.StartSecs > 0 {
-				done := make(chan error, 1)
-				go func() { done <- cmd.Wait() }()
-				select {
-				case <-spv.ctx.Done():
-					return
-				case e := <-done:
-					err = e
-					fmt.Printf("[taskmaster] Process exited before startsecs: %s\n", programConfig.Command)
-					retries++
-					if retries > programConfig.StartRetries {
-						fmt.Printf("[taskmaster] Aborting after %d retries: %s\n", retries-1, programConfig.Command)
-						return
-					}
-					continue
-				case <-time.After(time.Duration(programConfig.StartSecs) * time.Second):
-					// Process survived startsecs, continue
-				}
-			}
-
-			// Wait for process to exit
-			err = cmd.Wait()
-			var exitCode int
-			if err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-						exitCode = status.ExitStatus()
-					}
-				}
-			} else {
-				if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
-					exitCode = status.ExitStatus()
-				}
-			}
-
-			fmt.Printf("[taskmaster] Process exited: %s (code %d)\n", programConfig.Command, exitCode)
-
-			// Check if exit code is expected
-			expected := false
-			for _, code := range programConfig.ExitCodes {
-				if exitCode == code {
-					expected = true
-					break
-				}
-			}
-
-			// Decide restart policy
-			restart := false
-			switch programConfig.Autorestart {
-			case "always":
-				restart = true
-			case "never":
-				restart = false
-			case "unexpected":
-				restart = !expected
-			}
-
-			if restart {
-				fmt.Printf("[taskmaster] Restarting program: %s\n", programConfig.Command)
-				retries++
-				if retries > programConfig.StartRetries {
-					fmt.Printf("[taskmaster] Aborting after %d retries: %s\n", retries-1, programConfig.Command)
-					return
-				}
-				continue
-			} else {
-				fmt.Printf("[taskmaster] Not restarting program: %s\n", programConfig.Command)
-				return
-			}
-		}
-	}()
-	
-	// This approach was flawed - we need to return the actual PID and cmd
-	// Let me rewrite this function completely
-	return 0, nil
-}
-
-// startSingleWorkerNew creates and starts a single process instance
+// startSingleWorker creates and starts a single process instance
 // This is the core function that actually executes programs and sets up monitoring
 // Returns: PID of started process and the *exec.Cmd for management
-func startSingleWorkerNew(programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
+func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
 	// Step 1: Parse command string into program and arguments
 	// Example: "/bin/sleep 10" becomes ["/bin/sleep", "10"]
 	parts := strings.Fields(programConfig.Command)
@@ -308,7 +163,7 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	// Start the specified number of processes (numprocs)
 	// Each process gets an instance ID: 0, 1, 2, etc.
 	for i := 0; i < programConfig.NumProcs; i++ {
-		pid, cmd := startSingleWorkerNew(programConfig, spv)
+		pid, cmd := startSingleWorker(programConfig, spv)
 		if cmd != nil {
 			// Store the command in our tracking map
 			// Key structure: programs[program_name][instance_id] = *exec.Cmd
