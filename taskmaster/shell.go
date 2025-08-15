@@ -250,15 +250,14 @@ func (s *Shell) stopProgram(args []string) {
 	}
 	
 	fmt.Printf("Stopping program '%s'...\n", programName)
-	// Stop each running process
-	for _, proc := range processes {
-		if proc != nil {
-			s.supervisor.StopProcess(proc, &program)
-		}
+	
+	// Use the new StopProgram method which includes logging
+	err := s.supervisor.StopProgram(programName, &program)
+	if err != nil {
+		fmt.Printf("Error stopping program '%s': %v\n", programName, err)
+		return
 	}
 	
-	// Remove from running programs map
-	delete(s.supervisor.programs, programName)
 	fmt.Printf("Program '%s' stopped.\n", programName)
 }
 
@@ -277,6 +276,11 @@ func (s *Shell) restartProgram(args []string) {
 	}
 	
 	fmt.Printf("Restarting program '%s'...\n", programName)
+	
+	// Log the restart event
+	if s.supervisor.logger != nil {
+		s.supervisor.logger.LogProgramRestart(programName, "manual restart")
+	}
 	
 	// Stop first
 	s.stopProgram(args)
@@ -303,6 +307,9 @@ func (s *Shell) reloadConfig() {
 	newCfg, err := LoadConfig("taskmaster.conf")
 	if err != nil {
 		fmt.Printf("Error reloading config: %v\n", err)
+		if s.supervisor.logger != nil {
+			s.supervisor.logger.LogConfigReload(false, err.Error())
+		}
 		return
 	}
 	
@@ -315,6 +322,11 @@ func (s *Shell) reloadConfig() {
 	
 	// Handle differences between old and new config
 	s.handleConfigChanges(oldCfg, newCfg)
+	
+	// Log successful reload
+	if s.supervisor.logger != nil {
+		s.supervisor.logger.LogConfigReload(true, "")
+	}
 	
 	fmt.Println("Configuration reloaded successfully.")
 }
@@ -330,7 +342,7 @@ func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
 				oldProgram := oldCfg.Programs[name]
 				for _, proc := range processes {
 					if proc != nil {
-						s.supervisor.StopProcess(proc, &oldProgram)
+						s.supervisor.StopProcess(proc, name, &oldProgram)
 					}
 				}
 				delete(s.supervisor.programs, name)
@@ -354,7 +366,7 @@ func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
 			if processes, running := s.supervisor.programs[name]; running {
 				for _, proc := range processes {
 					if proc != nil {
-						s.supervisor.StopProcess(proc, &oldProgram)
+						s.supervisor.StopProcess(proc, name, &oldProgram)
 					}
 				}
 			}
@@ -388,6 +400,11 @@ func (s *Shell) quit() {
 	fmt.Println("Shutting down taskmaster...")
 	s.running = false  // Stop the shell loop
 	
+	// Log taskmaster shutdown
+	if s.supervisor.logger != nil {
+		s.supervisor.logger.LogTaskmasterStop()
+	}
+	
 	// Stop all programs before exiting
 	s.supervisor.mu.Lock()
 	defer s.supervisor.mu.Unlock()
@@ -398,13 +415,18 @@ func (s *Shell) quit() {
 		fmt.Printf("Stopping program: %s\n", name)
 		for _, proc := range processes {
 			if proc != nil {
-				s.supervisor.StopProcess(proc, &program)
+				s.supervisor.StopProcess(proc, name, &program)
 			}
 		}
 	}
 	
 	// Cancel supervisor context to stop monitoring goroutines
 	s.supervisor.cancel()
+	
+	// Close the logger
+	if s.supervisor.logger != nil {
+		s.supervisor.logger.Close()
+	}
 	
 	fmt.Println("Goodbye!")
 	os.Exit(0)  // Exit the entire application

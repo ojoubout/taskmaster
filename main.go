@@ -18,7 +18,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Step 2: Display loaded configuration for verification
+	// Step 2: Initialize the logging system
+	// Create a logger that writes to taskmaster.log with INFO level
+	logger, err := taskmaster.NewLogger("taskmaster.log", taskmaster.LogLevelInfo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error creating logger:", err)
+		os.Exit(1)
+	}
+	defer logger.Close() // Ensure logger is closed when main exits
+
+	// Step 3: Log taskmaster startup
+	logger.LogTaskmasterStart(os.Getpid(), "taskmaster.conf")
+
+	// Step 4: Display loaded configuration for verification
 	// This shows what programs were loaded and their basic settings
 	fmt.Println("Config loaded and validated successfully!")
 	for name, prog := range cfg.Programs {
@@ -27,23 +39,23 @@ func main() {
 			name, prog.Command, prog.NumProcs, prog.ExitCodes)
 	}
 	
-	// Step 3: Create the supervisor instance
+	// Step 5: Create the supervisor instance with logger
 	// The supervisor is the core component that manages all child processes
-	supervisor := taskmaster.NewSupervisor(cfg)
+	supervisor := taskmaster.NewSupervisor(cfg, logger)
 	
-	// Step 4: Start initial programs that have autostart=true
+	// Step 6: Start initial programs that have autostart=true
 	// This goes through all programs and starts the ones configured to auto-start
 	taskmaster.RunInitialState(supervisor)
 	
-	// Step 5: Set up signal handling for configuration reload
+	// Step 7: Set up signal handling for configuration reload
 	// SIGHUP signal is commonly used to tell daemons to reload their configuration
 	go taskmaster.SigNotifier(cfg)
 
-	// Step 6: Display process information
+	// Step 8: Display process information
 	// Shows that taskmaster is running and its Process ID (useful for sending signals)
 	fmt.Println("Taskmaster is running. PID:", os.Getpid())
 	
-	// Step 7: Start the interactive control shell
+	// Step 9: Start the interactive control shell
 	// This provides a command-line interface for managing processes (start, stop, status, etc.)
 	shell := taskmaster.NewShell(supervisor)
 	shell.Start() // This blocks and runs the interactive shell until user quits

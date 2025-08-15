@@ -22,24 +22,26 @@ type Supervisor struct {
 	cancel   context.CancelFunc          // Function to cancel the context (stops all goroutines)
 	wg       sync.WaitGroup              // Wait group to track running goroutines
 	mu       sync.RWMutex                // Read-Write mutex for thread-safe access to programs map
+	logger   *Logger                     // Logger for recording events
 }
 
 // NewSupervisor creates a new Supervisor instance with the given configuration
 // It initializes the context for cancellation and the programs tracking map
-func NewSupervisor(cfg *Config) *Supervisor {
+func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{
 		cfg:      cfg,
 		programs: make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
 		ctx:      ctx,
 		cancel:   cancel,
+		logger:   logger,
 	}
 }
 
 // startSingleWorker creates and starts a single process instance
 // This is the core function that actually executes programs and sets up monitoring
-// Returns: PID of started process and the *exec.Cmd for management
-func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
+// Returns: PID of started process, the *exec.Cmd for management, and program name
+func startSingleWorker(programName string, programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
 	// Step 1: Parse command string into program and arguments
 	// Example: "/bin/sleep 10" becomes ["/bin/sleep", "10"]
 	parts := strings.Fields(programConfig.Command)
@@ -93,12 +95,18 @@ func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd)
 	err := cmd.Start()  // This starts the process but doesn't wait for it
 	if err != nil {
 		fmt.Printf("[taskmaster] Failed to start %s: %v\n", programConfig.Command, err)
+		if spv.logger != nil {
+			spv.logger.LogStartupFailure(programName, 1, 1, err)
+		}
 		return 0, nil  // Return 0 PID and nil cmd to indicate failure
 	}
 
 	// Step 8: Get the PID and log success
 	pid := cmd.Process.Pid
 	fmt.Printf("[taskmaster] Started %s with PID %d\n", programConfig.Command, pid)
+	if spv.logger != nil {
+		spv.logger.LogProgramStart(programName, pid, programConfig.Command)
+	}
 
 	// Step 9: Define cleanup function for file handles
 	// This ensures files are properly closed when process ends
@@ -139,10 +147,30 @@ func startSingleWorker(programConfig *Program, spv *Supervisor) (int, *exec.Cmd)
 		// Step 10b: Wait for process to exit
 		// cmd.Wait() blocks until the process terminates
 		err = cmd.Wait()
+		
+		// Determine exit code and whether it was expected
+		exitCode := 0
+		expected := true
 		if err != nil {
+			if exitError, ok := err.(*exec.ExitError); ok {
+				exitCode = exitError.ExitCode()
+			}
+			// Check if this exit code is in the expected list
+			expected = false
+			for _, expectedCode := range programConfig.ExitCodes {
+				if exitCode == expectedCode {
+					expected = true
+					break
+				}
+			}
 			fmt.Printf("[taskmaster] Process %d exited with error: %v\n", pid, err)
 		} else {
 			fmt.Printf("[taskmaster] Process %d exited successfully\n", pid)
+		}
+		
+		// Log the exit event
+		if spv.logger != nil {
+			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
 		}
 
 		// TODO: Handle restart logic based on autorestart policy
@@ -163,7 +191,7 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	// Start the specified number of processes (numprocs)
 	// Each process gets an instance ID: 0, 1, 2, etc.
 	for i := 0; i < programConfig.NumProcs; i++ {
-		pid, cmd := startSingleWorker(programConfig, spv)
+		pid, cmd := startSingleWorker(programName, programConfig, spv)
 		if cmd != nil {
 			// Store the command in our tracking map
 			// Key structure: programs[program_name][instance_id] = *exec.Cmd
@@ -189,9 +217,34 @@ func RunInitialState(spv *Supervisor) {
 	}
 }
 
+// StopProgram stops all instances of a program
+// This is called by the shell when user types "stop program_name"
+func (spv *Supervisor) StopProgram(programName string, programConfig *Program) error {
+	processes, running := spv.programs[programName]
+	if !running || len(processes) == 0 {
+		return fmt.Errorf("program '%s' is not running", programName)
+	}
+	
+	// Stop each running process
+	for _, proc := range processes {
+		if proc != nil {
+			err := spv.StopProcess(proc, programName, programConfig)
+			if err != nil {
+				if spv.logger != nil {
+					spv.logger.LogError("stopping program "+programName, err)
+				}
+			}
+		}
+	}
+	
+	// Remove from running programs map
+	delete(spv.programs, programName)
+	return nil
+}
+
 // StopProcess gracefully stops a process using the configured stop signal
 // If the process doesn't exit within stopwaitsecs, it sends SIGKILL
-func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programConfig *Program) error {
+func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programConfig *Program) error {
 	// Validate that we have a running process to stop
 	if cmd == nil || cmd.Process == nil {
 		return fmt.Errorf("process not running")
@@ -218,7 +271,17 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programConfig *Program) error 
 	}
 
 	// Step 2: Send the stop signal to the process
-	fmt.Printf("[taskmaster] Sending signal %s to process %d\n", programConfig.StopSignal, cmd.Process.Pid)
+	pid := cmd.Process.Pid
+	signalName := programConfig.StopSignal
+	if signalName == "" {
+		signalName = "TERM"
+	}
+	
+	fmt.Printf("[taskmaster] Sending signal %s to process %d\n", signalName, pid)
+	if spv.logger != nil {
+		spv.logger.LogProgramStop(programName, pid, signalName)
+	}
+	
 	err := cmd.Process.Signal(sig)
 	if err != nil {
 		return fmt.Errorf("failed to send signal: %v", err)
