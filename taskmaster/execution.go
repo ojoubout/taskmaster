@@ -16,13 +16,14 @@ import (
 // Supervisor is the main component that manages all child processes
 // It tracks running programs, handles their lifecycle, and provides control interface
 type Supervisor struct {
-	cfg      *Config                     // Configuration loaded from YAML file
-	programs map[string]map[int]*exec.Cmd // Map: program_name -> instance_id -> process
-	ctx      context.Context             // Context for cancellation across all goroutines
-	cancel   context.CancelFunc          // Function to cancel the context (stops all goroutines)
-	wg       sync.WaitGroup              // Wait group to track running goroutines
-	mu       sync.RWMutex                // Read-Write mutex for thread-safe access to programs map
-	logger   *Logger                     // Logger for recording events
+	cfg         *Config                     // Configuration loaded from YAML file
+	programs    map[string]map[int]*exec.Cmd // Map: program_name -> instance_id -> process
+	retryCount  map[string]map[int]int      // Map: program_name -> instance_id -> retry_attempts
+	ctx         context.Context             // Context for cancellation across all goroutines
+	cancel      context.CancelFunc          // Function to cancel the context (stops all goroutines)
+	wg          sync.WaitGroup              // Wait group to track running goroutines
+	mu          sync.RWMutex                // Read-Write mutex for thread-safe access to programs map
+	logger      *Logger                     // Logger for recording events
 }
 
 // NewSupervisor creates a new Supervisor instance with the given configuration
@@ -30,18 +31,19 @@ type Supervisor struct {
 func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{
-		cfg:      cfg,
-		programs: make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
-		ctx:      ctx,
-		cancel:   cancel,
-		logger:   logger,
+		cfg:        cfg,
+		programs:   make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
+		retryCount: make(map[string]map[int]int),       // Initialize retry counter map
+		ctx:        ctx,
+		cancel:     cancel,
+		logger:     logger,
 	}
 }
 
 // startSingleWorker creates and starts a single process instance
 // This is the core function that actually executes programs and sets up monitoring
 // Returns: PID of started process, the *exec.Cmd for management, and program name
-func startSingleWorker(programName string, programConfig *Program, spv *Supervisor) (int, *exec.Cmd) {
+func startSingleWorker(programName string, programConfig *Program, instanceID int, spv *Supervisor) (int, *exec.Cmd) {
 	// Step 1: Parse command string into program and arguments
 	// Example: "/bin/sleep 10" becomes ["/bin/sleep", "10"]
 	parts := strings.Fields(programConfig.Command)
@@ -173,11 +175,135 @@ func startSingleWorker(programName string, programConfig *Program, spv *Supervis
 			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
 		}
 
-		// TODO: Handle restart logic based on autorestart policy
-		// This would check programConfig.Autorestart and restart if needed
+		// Step 10c: Handle restart logic based on autorestart policy
+		spv.handleProcessRestart(programName, programConfig, instanceID, expected, exitCode)
 	}()
 
 	return pid, cmd  // Return PID and command for tracking
+}
+
+// handleProcessRestart determines if and how to restart a process based on autorestart policy
+// This implements the core autorestart functionality according to supervisor behavior
+func (spv *Supervisor) handleProcessRestart(programName string, programConfig *Program, instanceID int, expectedExit bool, exitCode int) {
+	// Determine if we should restart based on autorestart policy
+	shouldRestart := false
+	
+	switch programConfig.Autorestart {
+	case "always":
+		// Always restart regardless of exit status
+		shouldRestart = true
+		fmt.Printf("[taskmaster] Program %s (instance %d) will be restarted (policy: always)\n", programName, instanceID)
+	case "never":
+		// Never restart
+		shouldRestart = false
+		fmt.Printf("[taskmaster] Program %s (instance %d) will not be restarted (policy: never)\n", programName, instanceID)
+	case "unexpected", "":
+		// Restart only on unexpected exits (default behavior if empty)
+		shouldRestart = !expectedExit
+		if shouldRestart {
+			fmt.Printf("[taskmaster] Program %s (instance %d) will be restarted (unexpected exit with code %d)\n", programName, instanceID, exitCode)
+		} else {
+			fmt.Printf("[taskmaster] Program %s (instance %d) will not be restarted (expected exit with code %d)\n", programName, instanceID, exitCode)
+		}
+	default:
+		// Invalid autorestart value, treat as "never"
+		shouldRestart = false
+		fmt.Printf("[taskmaster] Program %s (instance %d) has invalid autorestart policy '%s', treating as 'never'\n", programName, instanceID, programConfig.Autorestart)
+	}
+	
+	if !shouldRestart {
+		// Remove the process from tracking since it won't be restarted
+		spv.mu.Lock()
+		if spv.programs[programName] != nil {
+			delete(spv.programs[programName], instanceID)
+			// If no more instances, remove the program entirely
+			if len(spv.programs[programName]) == 0 {
+				delete(spv.programs, programName)
+			}
+		}
+		spv.mu.Unlock()
+		return
+	}
+	
+	// Initialize retry tracking if needed
+	spv.mu.Lock()
+	if spv.retryCount[programName] == nil {
+		spv.retryCount[programName] = make(map[int]int)
+	}
+	currentRetries := spv.retryCount[programName][instanceID]
+	spv.mu.Unlock()
+	
+	// Check if we've exceeded the maximum retry attempts
+	maxRetries := programConfig.StartRetries
+	if maxRetries <= 0 {
+		maxRetries = 3 // Default retry count if not specified
+	}
+	
+	if currentRetries >= maxRetries {
+		fmt.Printf("[taskmaster] Program %s (instance %d) has exceeded maximum retries (%d), giving up\n", programName, instanceID, maxRetries)
+		if spv.logger != nil {
+			spv.logger.LogError(fmt.Sprintf("program %s instance %d", programName, instanceID), 
+				fmt.Errorf("exceeded maximum restart attempts (%d)", maxRetries))
+		}
+		
+		// Remove from tracking
+		spv.mu.Lock()
+		if spv.programs[programName] != nil {
+			delete(spv.programs[programName], instanceID)
+			if len(spv.programs[programName]) == 0 {
+				delete(spv.programs, programName)
+			}
+		}
+		if spv.retryCount[programName] != nil {
+			delete(spv.retryCount[programName], instanceID)
+			if len(spv.retryCount[programName]) == 0 {
+				delete(spv.retryCount, programName)
+			}
+		}
+		spv.mu.Unlock()
+		return
+	}
+	
+	// Increment retry counter
+	spv.mu.Lock()
+	spv.retryCount[programName][instanceID] = currentRetries + 1
+	spv.mu.Unlock()
+	
+	// Add a small delay before restarting to prevent rapid restart loops
+	restartDelay := 1 * time.Second
+	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v (attempt %d/%d)\n", 
+		programName, instanceID, restartDelay, currentRetries+1, maxRetries)
+	
+	// Log the restart attempt
+	if spv.logger != nil {
+		spv.logger.LogProgramRestart(programName, fmt.Sprintf("autorestart attempt %d/%d", currentRetries+1, maxRetries))
+	}
+	
+	// Wait before restarting
+	select {
+	case <-spv.ctx.Done():
+		// Supervisor is shutting down, don't restart
+		return
+	case <-time.After(restartDelay):
+		// Delay completed, proceed with restart
+	}
+	
+	// Start the replacement process
+	pid, newCmd := startSingleWorker(programName, programConfig, instanceID, spv)
+	if newCmd != nil {
+		// Update the tracking map with the new process
+		spv.mu.Lock()
+		if spv.programs[programName] == nil {
+			spv.programs[programName] = make(map[int]*exec.Cmd)
+		}
+		spv.programs[programName][instanceID] = newCmd
+		spv.mu.Unlock()
+		
+		fmt.Printf("[taskmaster] Successfully restarted program %s (instance %d) with new PID %d\n", programName, instanceID, pid)
+	} else {
+		fmt.Printf("[taskmaster] Failed to restart program %s (instance %d)\n", programName, instanceID)
+		// The retry will be handled by the new process's monitoring goroutine if it fails again
+	}
 }
 
 // StartProgram starts all instances of a program according to its numprocs setting
@@ -191,7 +317,7 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	// Start the specified number of processes (numprocs)
 	// Each process gets an instance ID: 0, 1, 2, etc.
 	for i := 0; i < programConfig.NumProcs; i++ {
-		pid, cmd := startSingleWorker(programName, programConfig, spv)
+		pid, cmd := startSingleWorker(programName, programConfig, i, spv)
 		if cmd != nil {
 			// Store the command in our tracking map
 			// Key structure: programs[program_name][instance_id] = *exec.Cmd
