@@ -211,21 +211,56 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 		// Step 10a: Handle startsecs validation
 		// The process must run for at least startsecs to be considered "successfully started"
+		// In supervisor, processes that exit before startsecs are considered unexpected exits
+		var processExitErr error
+		var survivedStartsecs bool = true // Track if process survived startsecs
+		
 		if programConfig.StartSecs > 0 {
-			timer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
-			defer timer.Stop() // Clean up timer
-
+			fmt.Printf("[taskmaster] Process %d must run for %d seconds to be considered started\n", pid, programConfig.StartSecs)
+			
+			// Create channels for communication between goroutines
+			processExited := make(chan struct{})
+			startupTimer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
+			defer startupTimer.Stop()
+			
+			// Start a goroutine to wait for process exit
+			go func() {
+				processExitErr = cmd.Wait()
+				close(processExited)
+			}()
+			
+			// Race between startup timer and process exit
 			select {
-			case <-spv.ctx.Done(): // If supervisor is shutting down, exit
+			case <-spv.ctx.Done():
+				// Supervisor is shutting down, exit
 				return
-			case <-timer.C: // Timer expired - process survived startsecs
-				fmt.Printf("[taskmaster] Process %d survived startsecs, now monitoring\n", pid)
+			case <-startupTimer.C:
+				// Timer expired - process survived startsecs
+				fmt.Printf("[taskmaster] Process %d successfully started (survived %d seconds)\n", pid, programConfig.StartSecs)
+				if spv.logger != nil {
+					spv.logger.Info("Process %d (%s) successfully started after %d seconds", pid, programName, programConfig.StartSecs)
+				}
+				
+				// Now wait for the process to actually exit
+				<-processExited
+			case <-processExited:
+				// Process exited before startsecs - this should be considered unexpected
+				survivedStartsecs = false
+				fmt.Printf("[taskmaster] Process %d exited before startsecs (%d seconds)\n", pid, programConfig.StartSecs)
+				if spv.logger != nil {
+					spv.logger.Warn("Process %d (%s) exited before startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
+				}
 			}
+		} else {
+			// No startsecs validation required
+			fmt.Printf("[taskmaster] Process %d started (no startsecs validation)\n", pid)
+			
+			// Wait for process to exit
+			processExitErr = cmd.Wait()
 		}
 
-		// Step 10b: Wait for process to exit
-		// cmd.Wait() blocks until the process terminates
-		err = cmd.Wait()
+		// Step 10b: Process has exited, handle the exit
+		err = processExitErr
 
 		// Determine exit code and whether it was expected
 		exitCode := 0
@@ -247,12 +282,20 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			fmt.Printf("[taskmaster] Process %d exited successfully\n", pid)
 		}
 
+		// A process that exits before startsecs should be considered unexpected
+		// regardless of exit code (supervisor behavior)
+		if !survivedStartsecs {
+			expected = false
+			fmt.Printf("[taskmaster] Process %d marked as unexpected exit (failed startsecs validation)\n", pid)
+		}
+
 		// Log the exit event
 		if spv.logger != nil {
 			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
 		}
 
 		// Step 10c: Handle restart logic based on autorestart policy
+		// Note: startsecs doesn't prevent restarts in supervisor
 		spv.handleProcessRestart(programName, programConfig, instanceID, expected, exitCode)
 	}()
 
