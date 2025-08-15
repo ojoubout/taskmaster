@@ -93,13 +93,88 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 	fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
 	
-	// Step 7: Actually start the process
-	err := cmd.Start()  // This starts the process but doesn't wait for it
-	if err != nil {
-		fmt.Printf("[taskmaster] Failed to start %s: %v\n", programConfig.Command, err)
-		if spv.logger != nil {
-			spv.logger.LogStartupFailure(programName, 1, 1, err)
+	// Step 7: Actually start the process with retry logic
+	maxStartRetries := programConfig.StartRetries
+	if maxStartRetries <= 0 {
+		maxStartRetries = 3 // Default retry count if not specified
+	}
+	
+	var err error
+	var startAttempt int
+	
+	for startAttempt = 1; startAttempt <= maxStartRetries; startAttempt++ {
+		// Create a fresh command for each attempt
+		if startAttempt > 1 {
+			parts := strings.Fields(programConfig.Command)
+			cmd = exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
+			
+			// Re-apply all the configuration for retry attempts
+			if programConfig.Directory != "" {
+				cmd.Dir = programConfig.Directory
+			}
+			
+			env := os.Environ()
+			for k, v := range programConfig.Env {
+				env = append(env, k+"="+v)
+			}
+			cmd.Env = env
+			
+			if programConfig.Stdout != "" {
+				stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				if err != nil {
+					fmt.Printf("Failed to open stdout file %s: %v\n", programConfig.Stdout, err)
+				} else {
+					cmd.Stdout = stdoutFile
+				}
+			}
+			
+			if programConfig.Stderr != "" {
+				stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				if err != nil {
+					fmt.Printf("Failed to open stderr file %s: %v\n", programConfig.Stderr, err)
+				} else {
+					cmd.Stderr = stderrFile
+				}
+			}
+			
+			if programConfig.Umask != 0 {
+				oldUmask = syscall.Umask(programConfig.Umask)
+				defer syscall.Umask(oldUmask)
+			}
 		}
+		
+		err = cmd.Start()
+		if err == nil {
+			// Success! Break out of retry loop
+			break
+		}
+		
+		// Log the failed attempt
+		fmt.Printf("[taskmaster] Failed to start %s (attempt %d/%d): %v\n", 
+			programConfig.Command, startAttempt, maxStartRetries, err)
+		if spv.logger != nil {
+			spv.logger.LogStartupFailure(programName, startAttempt, maxStartRetries, err)
+		}
+		
+		// If this wasn't the last attempt, wait before retrying
+		if startAttempt < maxStartRetries {
+			retryDelay := 1 * time.Second
+			fmt.Printf("[taskmaster] Retrying startup in %v...\n", retryDelay)
+			
+			select {
+			case <-spv.ctx.Done():
+				// Supervisor is shutting down, don't retry
+				return 0, nil
+			case <-time.After(retryDelay):
+				// Delay completed, continue to next attempt
+			}
+		}
+	}
+	
+	// Check if all attempts failed
+	if err != nil {
+		fmt.Printf("[taskmaster] Failed to start %s after %d attempts, giving up\n", 
+			programConfig.Command, maxStartRetries)
 		return 0, nil  // Return 0 PID and nil cmd to indicate failure
 	}
 
@@ -230,53 +305,19 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	if spv.retryCount[programName] == nil {
 		spv.retryCount[programName] = make(map[int]int)
 	}
-	currentRetries := spv.retryCount[programName][instanceID]
 	spv.mu.Unlock()
 	
-	// Check if we've exceeded the maximum retry attempts
-	maxRetries := programConfig.StartRetries
-	if maxRetries <= 0 {
-		maxRetries = 3 // Default retry count if not specified
-	}
-	
-	if currentRetries >= maxRetries {
-		fmt.Printf("[taskmaster] Program %s (instance %d) has exceeded maximum retries (%d), giving up\n", programName, instanceID, maxRetries)
-		if spv.logger != nil {
-			spv.logger.LogError(fmt.Sprintf("program %s instance %d", programName, instanceID), 
-				fmt.Errorf("exceeded maximum restart attempts (%d)", maxRetries))
-		}
-		
-		// Remove from tracking
-		spv.mu.Lock()
-		if spv.programs[programName] != nil {
-			delete(spv.programs[programName], instanceID)
-			if len(spv.programs[programName]) == 0 {
-				delete(spv.programs, programName)
-			}
-		}
-		if spv.retryCount[programName] != nil {
-			delete(spv.retryCount[programName], instanceID)
-			if len(spv.retryCount[programName]) == 0 {
-				delete(spv.retryCount, programName)
-			}
-		}
-		spv.mu.Unlock()
-		return
-	}
-	
-	// Increment retry counter
-	spv.mu.Lock()
-	spv.retryCount[programName][instanceID] = currentRetries + 1
-	spv.mu.Unlock()
+	// Runtime restarts are unlimited in supervisor - no retry limit
+	// Only controlled by autorestart policy and backoff delay
 	
 	// Add a small delay before restarting to prevent rapid restart loops
 	restartDelay := 1 * time.Second
-	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v (attempt %d/%d)\n", 
-		programName, instanceID, restartDelay, currentRetries+1, maxRetries)
+	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v\n", 
+		programName, instanceID, restartDelay)
 	
 	// Log the restart attempt
 	if spv.logger != nil {
-		spv.logger.LogProgramRestart(programName, fmt.Sprintf("autorestart attempt %d/%d", currentRetries+1, maxRetries))
+		spv.logger.LogProgramRestart(programName, "autorestart")
 	}
 	
 	// Wait before restarting
