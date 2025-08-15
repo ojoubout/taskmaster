@@ -211,17 +211,18 @@ func (s *Shell) startProgram(args []string) {
 		return
 	}
 	
-	// Lock supervisor for writing since we'll modify the programs map
-	s.supervisor.mu.Lock()
-	defer s.supervisor.mu.Unlock()
+	// Check if already running (without holding lock)
+	s.supervisor.mu.RLock()
+	processes, running := s.supervisor.programs[programName]
+	s.supervisor.mu.RUnlock()
 	
-	// Check if already running
-	if processes, running := s.supervisor.programs[programName]; running && len(processes) > 0 {
+	if running && len(processes) > 0 {
 		fmt.Printf("Program '%s' is already running.\n", programName)
 		return
 	}
 	
 	fmt.Printf("Starting program '%s'...\n", programName)
+	// StartProgram handles its own locking
 	s.supervisor.StartProgram(programName, &program)
 	fmt.Printf("Program '%s' started.\n", programName)
 }
@@ -240,10 +241,11 @@ func (s *Shell) stopProgram(args []string) {
 		return
 	}
 	
-	s.supervisor.mu.Lock()
-	defer s.supervisor.mu.Unlock()
-	
+	// Check if program is running (without holding lock)
+	s.supervisor.mu.RLock()
 	processes, running := s.supervisor.programs[programName]
+	s.supervisor.mu.RUnlock()
+	
 	if !running || len(processes) == 0 {
 		fmt.Printf("Program '%s' is not running.\n", programName)
 		return
@@ -251,7 +253,7 @@ func (s *Shell) stopProgram(args []string) {
 	
 	fmt.Printf("Stopping program '%s'...\n", programName)
 	
-	// Use the new StopProgram method which includes logging
+	// StopProgram handles its own locking
 	err := s.supervisor.StopProgram(programName, &program)
 	if err != nil {
 		fmt.Printf("Error stopping program '%s': %v\n", programName, err)

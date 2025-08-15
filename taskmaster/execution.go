@@ -3,27 +3,28 @@
 package taskmaster
 
 import (
-	"context"   // For handling cancellation and timeouts across goroutines
-	"fmt"       // For formatted I/O operations (printing status messages)
-	"os"        // For file operations and process management
-	"os/exec"   // For executing external programs
-	"strings"   // For string manipulation (splitting command arguments)
-	"sync"      // For synchronization primitives (WaitGroup, mutex)
-	"syscall"   // For system calls (signals, umask)
-	"time"      // For time-based operations (delays, timeouts)
+	"context" // For handling cancellation and timeouts across goroutines
+	"fmt"     // For formatted I/O operations (printing status messages)
+	"os"      // For file operations and process management
+	"os/exec" // For executing external programs
+	"strings" // For string manipulation (splitting command arguments)
+	"sync"    // For synchronization primitives (WaitGroup, mutex)
+	"syscall" // For system calls (signals, umask)
+	"time"    // For time-based operations (delays, timeouts)
 )
 
 // Supervisor is the main component that manages all child processes
 // It tracks running programs, handles their lifecycle, and provides control interface
 type Supervisor struct {
-	cfg         *Config                     // Configuration loaded from YAML file
-	programs    map[string]map[int]*exec.Cmd // Map: program_name -> instance_id -> process
-	retryCount  map[string]map[int]int      // Map: program_name -> instance_id -> retry_attempts
-	ctx         context.Context             // Context for cancellation across all goroutines
-	cancel      context.CancelFunc          // Function to cancel the context (stops all goroutines)
-	wg          sync.WaitGroup              // Wait group to track running goroutines
-	mu          sync.RWMutex                // Read-Write mutex for thread-safe access to programs map
-	logger      *Logger                     // Logger for recording events
+	cfg             *Config                      // Configuration loaded from YAML file
+	programs        map[string]map[int]*exec.Cmd // Map: program_name -> instance_id -> process
+	retryCount      map[string]map[int]int       // Map: program_name -> instance_id -> retry_attempts
+	manuallyStopped map[string]map[int]bool      // Map: program_name -> instance_id -> manually_stopped_flag
+	ctx             context.Context              // Context for cancellation across all goroutines
+	cancel          context.CancelFunc           // Function to cancel the context (stops all goroutines)
+	wg              sync.WaitGroup               // Wait group to track running goroutines
+	mu              sync.RWMutex                 // Read-Write mutex for thread-safe access to programs map
+	logger          *Logger                      // Logger for recording events
 }
 
 // NewSupervisor creates a new Supervisor instance with the given configuration
@@ -31,12 +32,13 @@ type Supervisor struct {
 func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{
-		cfg:        cfg,
-		programs:   make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
-		retryCount: make(map[string]map[int]int),       // Initialize retry counter map
-		ctx:        ctx,
-		cancel:     cancel,
-		logger:     logger,
+		cfg:             cfg,
+		programs:        make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
+		retryCount:      make(map[string]map[int]int),       // Initialize retry counter map
+		manuallyStopped: make(map[string]map[int]bool),      // Initialize manually stopped tracking map
+		ctx:             ctx,
+		cancel:          cancel,
+		logger:          logger,
 	}
 }
 
@@ -56,9 +58,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 	// Step 3: Set up environment variables
 	// Start with system environment and add custom variables from config
-	env := os.Environ()  // Get current environment
+	env := os.Environ() // Get current environment
 	for k, v := range programConfig.Env {
-		env = append(env, k+"="+v)  // Add each custom env var
+		env = append(env, k+"="+v) // Add each custom env var
 	}
 	cmd.Env = env
 
@@ -70,7 +72,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		if err != nil {
 			fmt.Printf("Failed to open stdout file %s: %v\n", programConfig.Stdout, err)
 		} else {
-			cmd.Stdout = stdoutFile  // Redirect process stdout to file
+			cmd.Stdout = stdoutFile // Redirect process stdout to file
 		}
 	}
 
@@ -80,45 +82,45 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		if err != nil {
 			fmt.Printf("Failed to open stderr file %s: %v\n", programConfig.Stderr, err)
 		} else {
-			cmd.Stderr = stderrFile  // Redirect process stderr to file
+			cmd.Stderr = stderrFile // Redirect process stderr to file
 		}
 	}
 
 	// Step 6: Set umask (file permission mask) if specified
 	var oldUmask int
 	if programConfig.Umask != 0 {
-		oldUmask = syscall.Umask(programConfig.Umask)  // Set new umask, save old one
-		defer syscall.Umask(oldUmask)                  // Restore old umask when function returns
+		oldUmask = syscall.Umask(programConfig.Umask) // Set new umask, save old one
+		defer syscall.Umask(oldUmask)                 // Restore old umask when function returns
 	}
 
 	fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
-	
+
 	// Step 7: Actually start the process with retry logic
 	maxStartRetries := programConfig.StartRetries
 	if maxStartRetries <= 0 {
 		maxStartRetries = 3 // Default retry count if not specified
 	}
-	
+
 	var err error
 	var startAttempt int
-	
+
 	for startAttempt = 1; startAttempt <= maxStartRetries; startAttempt++ {
 		// Create a fresh command for each attempt
 		if startAttempt > 1 {
 			parts := strings.Fields(programConfig.Command)
 			cmd = exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
-			
+
 			// Re-apply all the configuration for retry attempts
 			if programConfig.Directory != "" {
 				cmd.Dir = programConfig.Directory
 			}
-			
+
 			env := os.Environ()
 			for k, v := range programConfig.Env {
 				env = append(env, k+"="+v)
 			}
 			cmd.Env = env
-			
+
 			if programConfig.Stdout != "" {
 				stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
@@ -127,7 +129,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 					cmd.Stdout = stdoutFile
 				}
 			}
-			
+
 			if programConfig.Stderr != "" {
 				stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
@@ -136,31 +138,31 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 					cmd.Stderr = stderrFile
 				}
 			}
-			
+
 			if programConfig.Umask != 0 {
 				oldUmask = syscall.Umask(programConfig.Umask)
 				defer syscall.Umask(oldUmask)
 			}
 		}
-		
+
 		err = cmd.Start()
 		if err == nil {
 			// Success! Break out of retry loop
 			break
 		}
-		
+
 		// Log the failed attempt
-		fmt.Printf("[taskmaster] Failed to start %s (attempt %d/%d): %v\n", 
+		fmt.Printf("[taskmaster] Failed to start %s (attempt %d/%d): %v\n",
 			programConfig.Command, startAttempt, maxStartRetries, err)
 		if spv.logger != nil {
 			spv.logger.LogStartupFailure(programName, startAttempt, maxStartRetries, err)
 		}
-		
+
 		// If this wasn't the last attempt, wait before retrying
 		if startAttempt < maxStartRetries {
 			retryDelay := 1 * time.Second
 			fmt.Printf("[taskmaster] Retrying startup in %v...\n", retryDelay)
-			
+
 			select {
 			case <-spv.ctx.Done():
 				// Supervisor is shutting down, don't retry
@@ -170,12 +172,12 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			}
 		}
 	}
-	
+
 	// Check if all attempts failed
 	if err != nil {
-		fmt.Printf("[taskmaster] Failed to start %s after %d attempts, giving up\n", 
+		fmt.Printf("[taskmaster] Failed to start %s after %d attempts, giving up\n",
 			programConfig.Command, maxStartRetries)
-		return 0, nil  // Return 0 PID and nil cmd to indicate failure
+		return 0, nil // Return 0 PID and nil cmd to indicate failure
 	}
 
 	// Step 8: Get the PID and log success
@@ -189,7 +191,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	// This ensures files are properly closed when process ends
 	closeFiles := func() {
 		if cmd.Stdout != nil {
-			if file, ok := cmd.Stdout.(*os.File); ok {  // Type assertion to check if it's a file
+			if file, ok := cmd.Stdout.(*os.File); ok { // Type assertion to check if it's a file
 				file.Close()
 			}
 		}
@@ -202,21 +204,21 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 	// Step 10: Start monitoring goroutine
 	// This runs concurrently to monitor the process lifecycle
-	spv.wg.Add(1)  // Add to wait group so we can wait for all goroutines to finish
+	spv.wg.Add(1) // Add to wait group so we can wait for all goroutines to finish
 	go func() {
-		defer spv.wg.Done()  // Mark this goroutine as done when it exits
-		defer closeFiles()   // Ensure files are closed when goroutine exits
+		defer spv.wg.Done() // Mark this goroutine as done when it exits
+		defer closeFiles()  // Ensure files are closed when goroutine exits
 
 		// Step 10a: Handle startsecs validation
 		// The process must run for at least startsecs to be considered "successfully started"
 		if programConfig.StartSecs > 0 {
 			timer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
-			defer timer.Stop()  // Clean up timer
-			
+			defer timer.Stop() // Clean up timer
+
 			select {
-			case <-spv.ctx.Done():  // If supervisor is shutting down, exit
+			case <-spv.ctx.Done(): // If supervisor is shutting down, exit
 				return
-			case <-timer.C:  // Timer expired - process survived startsecs
+			case <-timer.C: // Timer expired - process survived startsecs
 				fmt.Printf("[taskmaster] Process %d survived startsecs, now monitoring\n", pid)
 			}
 		}
@@ -224,7 +226,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		// Step 10b: Wait for process to exit
 		// cmd.Wait() blocks until the process terminates
 		err = cmd.Wait()
-		
+
 		// Determine exit code and whether it was expected
 		exitCode := 0
 		expected := true
@@ -244,7 +246,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		} else {
 			fmt.Printf("[taskmaster] Process %d exited successfully\n", pid)
 		}
-		
+
 		// Log the exit event
 		if spv.logger != nil {
 			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
@@ -254,15 +256,41 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		spv.handleProcessRestart(programName, programConfig, instanceID, expected, exitCode)
 	}()
 
-	return pid, cmd  // Return PID and command for tracking
+	return pid, cmd // Return PID and command for tracking
 }
 
 // handleProcessRestart determines if and how to restart a process based on autorestart policy
 // This implements the core autorestart functionality according to supervisor behavior
 func (spv *Supervisor) handleProcessRestart(programName string, programConfig *Program, instanceID int, expectedExit bool, exitCode int) {
+	// Check if this process was manually stopped
+	spv.mu.Lock()
+	manualStop := spv.manuallyStopped[programName][instanceID]
+	if manualStop {
+		// Clean up the manually stopped flag since process has exited
+		delete(spv.manuallyStopped[programName], instanceID)
+		if len(spv.manuallyStopped[programName]) == 0 {
+			delete(spv.manuallyStopped, programName)
+		}
+	}
+	spv.mu.Unlock()
+
+	if manualStop {
+		fmt.Printf("[taskmaster] Program %s (instance %d) was manually stopped, not restarting\n", programName, instanceID)
+		// Remove from tracking since it won't be restarted
+		spv.mu.Lock()
+		if spv.programs[programName] != nil {
+			delete(spv.programs[programName], instanceID)
+			if len(spv.programs[programName]) == 0 {
+				delete(spv.programs, programName)
+			}
+		}
+		spv.mu.Unlock()
+		return
+	}
+
 	// Determine if we should restart based on autorestart policy
 	shouldRestart := false
-	
+
 	switch programConfig.Autorestart {
 	case "always":
 		// Always restart regardless of exit status
@@ -285,7 +313,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		shouldRestart = false
 		fmt.Printf("[taskmaster] Program %s (instance %d) has invalid autorestart policy '%s', treating as 'never'\n", programName, instanceID, programConfig.Autorestart)
 	}
-	
+
 	if !shouldRestart {
 		// Remove the process from tracking since it won't be restarted
 		spv.mu.Lock()
@@ -299,27 +327,27 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		spv.mu.Unlock()
 		return
 	}
-	
+
 	// Initialize retry tracking if needed
 	spv.mu.Lock()
 	if spv.retryCount[programName] == nil {
 		spv.retryCount[programName] = make(map[int]int)
 	}
 	spv.mu.Unlock()
-	
+
 	// Runtime restarts are unlimited in supervisor - no retry limit
 	// Only controlled by autorestart policy and backoff delay
-	
+
 	// Add a small delay before restarting to prevent rapid restart loops
 	restartDelay := 1 * time.Second
-	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v\n", 
+	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v\n",
 		programName, instanceID, restartDelay)
-	
+
 	// Log the restart attempt
 	if spv.logger != nil {
 		spv.logger.LogProgramRestart(programName, "autorestart")
 	}
-	
+
 	// Wait before restarting
 	select {
 	case <-spv.ctx.Done():
@@ -328,7 +356,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	case <-time.After(restartDelay):
 		// Delay completed, proceed with restart
 	}
-	
+
 	// Start the replacement process
 	pid, newCmd := startSingleWorker(programName, programConfig, instanceID, spv)
 	if newCmd != nil {
@@ -339,7 +367,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		}
 		spv.programs[programName][instanceID] = newCmd
 		spv.mu.Unlock()
-		
+
 		fmt.Printf("[taskmaster] Successfully restarted program %s (instance %d) with new PID %d\n", programName, instanceID, pid)
 	} else {
 		fmt.Printf("[taskmaster] Failed to restart program %s (instance %d)\n", programName, instanceID)
@@ -354,7 +382,16 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	if spv.programs[programName] == nil {
 		spv.programs[programName] = make(map[int]*exec.Cmd)
 	}
-	
+
+	// Clear any manually stopped flags for this program since we're starting it manually
+	// This allows autorestart to work again after manual start
+	spv.mu.Lock()
+	if spv.manuallyStopped[programName] != nil {
+		delete(spv.manuallyStopped, programName)
+		fmt.Printf("[taskmaster] Cleared manually stopped flags for program %s\n", programName)
+	}
+	spv.mu.Unlock()
+
 	// Start the specified number of processes (numprocs)
 	// Each process gets an instance ID: 0, 1, 2, etc.
 	for i := 0; i < programConfig.NumProcs; i++ {
@@ -371,13 +408,10 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 // RunInitialState starts all programs that have autostart=true
 // This is called when taskmaster first starts up
 func RunInitialState(spv *Supervisor) {
-	spv.mu.Lock()    // Lock for writing since we're modifying the programs map
-	defer spv.mu.Unlock()
-	
 	// Iterate through all configured programs
 	for name, programConfig := range spv.cfg.Programs {
 		if !programConfig.Autostart {
-			continue  // Skip programs that shouldn't auto-start
+			continue // Skip programs that shouldn't auto-start
 		}
 		// Start programs with autostart=true
 		spv.StartProgram(name, &programConfig)
@@ -391,7 +425,19 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 	if !running || len(processes) == 0 {
 		return fmt.Errorf("program '%s' is not running", programName)
 	}
-	
+
+	// Mark all instances as manually stopped before stopping them
+	// This prevents autorestart when the processes exit
+	spv.mu.Lock()
+	if spv.manuallyStopped[programName] == nil {
+		spv.manuallyStopped[programName] = make(map[int]bool)
+	}
+	for instanceID := range processes {
+		spv.manuallyStopped[programName][instanceID] = true
+		fmt.Printf("[taskmaster] Marking program %s (instance %d) as manually stopped\n", programName, instanceID)
+	}
+	spv.mu.Unlock()
+
 	// Stop each running process
 	for _, proc := range processes {
 		if proc != nil {
@@ -403,7 +449,7 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 			}
 		}
 	}
-	
+
 	// Remove from running programs map
 	delete(spv.programs, programName)
 	return nil
@@ -422,19 +468,19 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	sig := syscall.SIGTERM // Default signal
 	switch programConfig.StopSignal {
 	case "HUP":
-		sig = syscall.SIGHUP   // Hangup signal
+		sig = syscall.SIGHUP // Hangup signal
 	case "INT":
-		sig = syscall.SIGINT   // Interrupt signal (Ctrl+C)
+		sig = syscall.SIGINT // Interrupt signal (Ctrl+C)
 	case "QUIT":
-		sig = syscall.SIGQUIT  // Quit signal (Ctrl+\)
+		sig = syscall.SIGQUIT // Quit signal (Ctrl+\)
 	case "KILL":
-		sig = syscall.SIGKILL  // Kill signal (cannot be caught)
+		sig = syscall.SIGKILL // Kill signal (cannot be caught)
 	case "USR1":
-		sig = syscall.SIGUSR1  // User-defined signal 1
+		sig = syscall.SIGUSR1 // User-defined signal 1
 	case "USR2":
-		sig = syscall.SIGUSR2  // User-defined signal 2
+		sig = syscall.SIGUSR2 // User-defined signal 2
 	case "TERM":
-		sig = syscall.SIGTERM  // Termination signal (default)
+		sig = syscall.SIGTERM // Termination signal (default)
 	}
 
 	// Step 2: Send the stop signal to the process
@@ -443,12 +489,12 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	if signalName == "" {
 		signalName = "TERM"
 	}
-	
+
 	fmt.Printf("[taskmaster] Sending signal %s to process %d\n", signalName, pid)
 	if spv.logger != nil {
 		spv.logger.LogProgramStop(programName, pid, signalName)
 	}
-	
+
 	err := cmd.Process.Signal(sig)
 	if err != nil {
 		return fmt.Errorf("failed to send signal: %v", err)
@@ -459,11 +505,21 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	if waitSecs <= 0 {
 		waitSecs = 5 // Default wait time if not specified
 	}
-	
+
 	// Use a goroutine to wait for process exit
 	done := make(chan error, 1)
 	go func() {
-		done <- cmd.Wait()  // This blocks until process exits
+	// Poll the process to see if it's still running instead of calling Wait()
+	// since the monitoring goroutine is already calling Wait()
+	for {
+	err := cmd.Process.Signal(syscall.Signal(0))
+	if err != nil {
+	// Process no longer exists
+	done <- nil
+	return
+	}
+	time.Sleep(100 * time.Millisecond) // Check every 100ms
+	}
 	}()
 
 	// Step 4: Race between timeout and process exit
@@ -471,7 +527,7 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	case <-time.After(time.Duration(waitSecs) * time.Second):
 		// Timeout expired - process didn't exit gracefully, force kill it
 		fmt.Printf("[taskmaster] Process %d did not exit after %d seconds, killing\n", cmd.Process.Pid, waitSecs)
-		err := cmd.Process.Kill()  // Send SIGKILL (cannot be ignored)
+		err := cmd.Process.Kill() // Send SIGKILL (cannot be ignored)
 		if err != nil {
 			return fmt.Errorf("failed to kill process: %v", err)
 		}
