@@ -6,6 +6,7 @@ import (
 	"bufio"   // For buffered I/O operations (reading user input line by line)
 	"fmt"     // For formatted I/O operations (printing to console)
 	"os"      // For operating system interface (os.Stdin, os.Exit)
+	"os/exec" // For capturing process list snapshots when reloading config
 	"strings" // For string manipulation (splitting, trimming, etc.)
 	"time"    // For time duration formatting
 )
@@ -335,7 +336,7 @@ func (s *Shell) restartProgram(args []string) {
 func (s *Shell) reloadConfig() {
 	fmt.Println("Reloading configuration...")
 
-	// Load new config from file
+	// Load new config from file (no lock held yet)
 	newCfg, err := LoadConfig("taskmaster.conf")
 	if err != nil {
 		fmt.Printf("Error reloading config: %v\n", err)
@@ -345,14 +346,13 @@ func (s *Shell) reloadConfig() {
 		return
 	}
 
+	// Swap config under lock then release quickly to avoid deadlocks
 	s.supervisor.mu.Lock()
-	defer s.supervisor.mu.Unlock()
-
-	// Keep reference to old config for comparison
 	oldCfg := s.supervisor.cfg
 	s.supervisor.cfg = newCfg
+	s.supervisor.mu.Unlock()
 
-	// Handle differences between old and new config
+	// Apply differences without holding the supervisor lock
 	s.handleConfigChanges(oldCfg, newCfg)
 
 	// Log successful reload
@@ -366,49 +366,83 @@ func (s *Shell) reloadConfig() {
 // handleConfigChanges compares old and new configurations and applies changes
 // This stops removed programs, starts new programs, and restarts modified programs
 func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
-	// Step 1: Stop programs that are no longer in the new configuration
+	// Step 1: Removed programs
 	for name := range oldCfg.Programs {
-		if _, exists := newCfg.Programs[name]; !exists {
-			fmt.Printf("Stopping removed program: %s\n", name)
-			if processes, running := s.supervisor.programs[name]; running {
-				oldProgram := oldCfg.Programs[name]
-				for _, proc := range processes {
-					if proc != nil {
-						s.supervisor.StopProcess(proc, name, &oldProgram)
-					}
-				}
-				delete(s.supervisor.programs, name)
+		if _, exists := newCfg.Programs[name]; exists {
+			continue
+		}
+		fmt.Printf("Stopping removed program: %s\n", name)
+
+		// Snapshot processes under lock
+		var procs []*exec.Cmd
+		var oldProgram Program
+		s.supervisor.mu.Lock()
+		if processes, running := s.supervisor.programs[name]; running {
+			// Mark all instances as manually stopped to suppress autorestart
+			if s.supervisor.manuallyStopped[name] == nil {
+				s.supervisor.manuallyStopped[name] = make(map[int]bool)
+			}
+			oldProgram = oldCfg.Programs[name]
+			for id, p := range processes {
+				procs = append(procs, p)
+				s.supervisor.manuallyStopped[name][id] = true
+			}
+			delete(s.supervisor.programs, name)
+		}
+		s.supervisor.mu.Unlock()
+
+		// Stop processes outside lock
+		for _, p := range procs {
+			if p != nil {
+				s.supervisor.StopProcess(p, name, &oldProgram)
 			}
 		}
 	}
 
-	// Step 2: Handle new programs and modified programs
+	// Step 2: New and changed programs
 	for name, newProgram := range newCfg.Programs {
 		oldProgram, existed := oldCfg.Programs[name]
-
 		if !existed {
-			// This is a completely new program
-			fmt.Printf("Starting new program: %s\n", name)
+			// New program
 			if newProgram.Autostart {
+				fmt.Printf("Starting new program: %s\n", name)
 				s.supervisor.StartProgram(name, &newProgram)
 			}
-		} else if !programsEqual(oldProgram, newProgram) {
-			// Program exists but has been modified - restart it
+			continue
+		}
+
+		if !programsEqual(oldProgram, newProgram) {
 			fmt.Printf("Restarting changed program: %s\n", name)
+
+			// Snapshot and remove old processes
+			var procs []*exec.Cmd
+			s.supervisor.mu.Lock()
 			if processes, running := s.supervisor.programs[name]; running {
-				for _, proc := range processes {
-					if proc != nil {
-						s.supervisor.StopProcess(proc, name, &oldProgram)
-					}
+				// Mark all instances as manually stopped so they won't autorestart under old config
+				if s.supervisor.manuallyStopped[name] == nil {
+					s.supervisor.manuallyStopped[name] = make(map[int]bool)
+				}
+				for id, p := range processes {
+					procs = append(procs, p)
+					s.supervisor.manuallyStopped[name][id] = true
+				}
+				delete(s.supervisor.programs, name)
+			}
+			s.supervisor.mu.Unlock()
+
+			// Stop old processes
+			for _, p := range procs {
+				if p != nil {
+					s.supervisor.StopProcess(p, name, &oldProgram)
 				}
 			}
-			delete(s.supervisor.programs, name)
 
+			// Start new config if autostart
 			if newProgram.Autostart {
 				s.supervisor.StartProgram(name, &newProgram)
 			}
 		}
-		// If program exists and hasn't changed, leave it alone
+		// Unchanged programs untouched
 	}
 }
 
