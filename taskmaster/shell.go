@@ -64,7 +64,10 @@ func (s *Shell) Start() {
 
 		// Read next line of input from user
 		if !scanner.Scan() {
-			break // Exit if there's an error or EOF (Ctrl+D)
+			// EOF (Ctrl+D) or error - trigger graceful shutdown
+			fmt.Println() // Print newline for clean output
+			s.quit()
+			return
 		}
 
 		// Get the command text and remove leading/trailing whitespace
@@ -80,6 +83,7 @@ func (s *Shell) Start() {
 	// Check if there was an error reading input
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error reading input: %v\n", err)
+		s.quit()
 	}
 }
 
