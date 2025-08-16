@@ -53,9 +53,8 @@ func main() {
 	// This goes through all programs and starts the ones configured to auto-start
 	taskmaster.RunInitialState(supervisor)
 
-	// Step 7: Set up signal handling for configuration reload
-	// SIGHUP signal is commonly used to tell daemons to reload their configuration
-	go taskmaster.SigNotifier(cfg)
+	// Step 7: Set up signal handling for reload (SIGHUP) and graceful shutdown (SIGINT/SIGTERM)
+	taskmaster.SetupSignalHandling(supervisor, configFile)
 
 	// Step 8: Display process information
 	// Shows that taskmaster is running and its Process ID (useful for sending signals)

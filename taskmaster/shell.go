@@ -6,7 +6,6 @@ import (
 	"bufio"   // For buffered I/O operations (reading user input line by line)
 	"fmt"     // For formatted I/O operations (printing to console)
 	"os"      // For operating system interface (os.Stdin, os.Exit)
-	"os/exec" // For capturing process list snapshots when reloading config
 	"strings" // For string manipulation (splitting, trimming, etc.)
 	"time"    // For time duration formatting
 )
@@ -15,14 +14,16 @@ import (
 // It provides commands to control the supervisor and its programs
 type Shell struct {
 	supervisor *Supervisor // Reference to the supervisor that manages processes
+	configFile string      // Path to config file for reloads
 	running    bool        // Flag to control the main shell loop
 }
 
 // NewShell creates a new Shell instance with the given supervisor
 // This is a constructor function following Go conventions
-func NewShell(supervisor *Supervisor) *Shell {
+func NewShell(supervisor *Supervisor, configFile string) *Shell {
 	return &Shell{
 		supervisor: supervisor,
+		configFile: configFile,
 		running:    true, // Start in running state
 	}
 }
@@ -108,7 +109,11 @@ func (s *Shell) processCommand(command string) {
 	case "restart":
 		s.restartProgram(args)
 	case "reload":
-		s.reloadConfig()
+		if err := s.supervisor.ReloadConfig(s.configFile); err != nil {
+			fmt.Printf("Reload failed: %v\n", err)
+		} else {
+			fmt.Println("Configuration reloaded successfully.")
+		}
 	case "quit", "exit":
 		s.quit()
 	default:
@@ -331,134 +336,7 @@ func (s *Shell) restartProgram(args []string) {
 	s.startProgram(args)
 }
 
-// reloadConfig reloads the configuration file and applies changes
-// This implements hot-reloading of configuration without restarting taskmaster
-func (s *Shell) reloadConfig() {
-	fmt.Println("Reloading configuration...")
-
-	// Load new config from file (no lock held yet)
-	newCfg, err := LoadConfig("taskmaster.conf")
-	if err != nil {
-		fmt.Printf("Error reloading config: %v\n", err)
-		if s.supervisor.logger != nil {
-			s.supervisor.logger.LogConfigReload(false, err.Error())
-		}
-		return
-	}
-
-	// Swap config under lock then release quickly to avoid deadlocks
-	s.supervisor.mu.Lock()
-	oldCfg := s.supervisor.cfg
-	s.supervisor.cfg = newCfg
-	s.supervisor.mu.Unlock()
-
-	// Apply differences without holding the supervisor lock
-	s.handleConfigChanges(oldCfg, newCfg)
-
-	// Log successful reload
-	if s.supervisor.logger != nil {
-		s.supervisor.logger.LogConfigReload(true, "")
-	}
-
-	fmt.Println("Configuration reloaded successfully.")
-}
-
-// handleConfigChanges compares old and new configurations and applies changes
-// This stops removed programs, starts new programs, and restarts modified programs
-func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
-	// Step 1: Removed programs
-	for name := range oldCfg.Programs {
-		if _, exists := newCfg.Programs[name]; exists {
-			continue
-		}
-		fmt.Printf("Stopping removed program: %s\n", name)
-
-		// Snapshot processes under lock
-		var procs []*exec.Cmd
-		var oldProgram Program
-		s.supervisor.mu.Lock()
-		if processes, running := s.supervisor.programs[name]; running {
-			// Mark all instances as manually stopped to suppress autorestart
-			if s.supervisor.manuallyStopped[name] == nil {
-				s.supervisor.manuallyStopped[name] = make(map[int]bool)
-			}
-			oldProgram = oldCfg.Programs[name]
-			for id, p := range processes {
-				procs = append(procs, p)
-				s.supervisor.manuallyStopped[name][id] = true
-			}
-			delete(s.supervisor.programs, name)
-		}
-		s.supervisor.mu.Unlock()
-
-		// Stop processes outside lock
-		for _, p := range procs {
-			if p != nil {
-				s.supervisor.StopProcess(p, name, &oldProgram)
-			}
-		}
-	}
-
-	// Step 2: New and changed programs
-	for name, newProgram := range newCfg.Programs {
-		oldProgram, existed := oldCfg.Programs[name]
-		if !existed {
-			// New program
-			if newProgram.Autostart {
-				fmt.Printf("Starting new program: %s\n", name)
-				s.supervisor.StartProgram(name, &newProgram)
-			}
-			continue
-		}
-
-		if !programsEqual(oldProgram, newProgram) {
-			fmt.Printf("Restarting changed program: %s\n", name)
-
-			// Snapshot and remove old processes
-			var procs []*exec.Cmd
-			s.supervisor.mu.Lock()
-			if processes, running := s.supervisor.programs[name]; running {
-				// Mark all instances as manually stopped so they won't autorestart under old config
-				if s.supervisor.manuallyStopped[name] == nil {
-					s.supervisor.manuallyStopped[name] = make(map[int]bool)
-				}
-				for id, p := range processes {
-					procs = append(procs, p)
-					s.supervisor.manuallyStopped[name][id] = true
-				}
-				delete(s.supervisor.programs, name)
-			}
-			s.supervisor.mu.Unlock()
-
-			// Stop old processes
-			for _, p := range procs {
-				if p != nil {
-					s.supervisor.StopProcess(p, name, &oldProgram)
-				}
-			}
-
-			// Start new config if autostart
-			if newProgram.Autostart {
-				s.supervisor.StartProgram(name, &newProgram)
-			}
-		}
-		// Unchanged programs untouched
-	}
-}
-
-// programsEqual compares two Program configurations to see if they're identical
-// This determines whether a program needs to be restarted after config reload
-func programsEqual(p1, p2 Program) bool {
-	// Compare the most important fields that would require a restart
-	return p1.Command == p2.Command &&
-		p1.NumProcs == p2.NumProcs &&
-		p1.Directory == p2.Directory &&
-		p1.Autostart == p2.Autostart &&
-		p1.Autorestart == p2.Autorestart &&
-		p1.StopSignal == p2.StopSignal
-	// Note: We don't compare all fields (like stdout/stderr paths)
-	// since some changes might not require a restart
-}
+// (Reload logic removed from shell; delegated to Supervisor.ReloadConfig)
 
 // quit shuts down the taskmaster system gracefully
 // This stops all running programs and exits the application

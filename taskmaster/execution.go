@@ -44,6 +44,148 @@ func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 	}
 }
 
+// ReloadConfig reloads the configuration from file, applies differences (add, remove, restart changed)
+// and leaves unchanged programs running. It mirrors supervisorctl reload behavior.
+func (spv *Supervisor) ReloadConfig(configFile string) error {
+	newCfg, err := LoadConfig(configFile)
+	if err != nil {
+		if spv.logger != nil {
+			spv.logger.LogConfigReload(false, err.Error())
+		}
+		return err
+	}
+
+	// Swap config under lock quickly
+	spv.mu.Lock()
+	oldCfg := spv.cfg
+	spv.cfg = newCfg
+	spv.mu.Unlock()
+
+	// Apply changes without holding lock
+	spv.applyConfigChanges(oldCfg, newCfg)
+
+	if spv.logger != nil {
+		spv.logger.LogConfigReload(true, "")
+	}
+	return nil
+}
+
+// applyConfigChanges compares old and new configs and applies lifecycle changes.
+// Removed programs are stopped (no autorestart), changed programs are restarted, new autostart ones are started.
+func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
+	// Removed programs
+	for name := range oldCfg.Programs {
+		if _, exists := newCfg.Programs[name]; exists {
+			continue
+		}
+		fmt.Printf("[taskmaster] Removing program %s\n", name)
+		var procs []*exec.Cmd
+		var oldProgram Program
+		spv.mu.Lock()
+		if processes, running := spv.programs[name]; running {
+			if spv.manuallyStopped[name] == nil {
+				spv.manuallyStopped[name] = make(map[int]bool)
+			}
+			oldProgram = oldCfg.Programs[name]
+			for id, p := range processes {
+				procs = append(procs, p)
+				spv.manuallyStopped[name][id] = true
+			}
+			delete(spv.programs, name)
+		}
+		spv.mu.Unlock()
+
+		for _, p := range procs {
+			if p != nil {
+				spv.StopProcess(p, name, &oldProgram)
+			}
+		}
+	}
+
+	// New & changed programs
+	for name, newProgram := range newCfg.Programs {
+		oldProgram, existed := oldCfg.Programs[name]
+		if !existed {
+			if newProgram.Autostart {
+				fmt.Printf("[taskmaster] Starting new program %s\n", name)
+				spv.StartProgram(name, &newProgram)
+			}
+			continue
+		}
+		if !programsEqual(oldProgram, newProgram) {
+			fmt.Printf("[taskmaster] Restarting modified program %s\n", name)
+			var procs []*exec.Cmd
+			spv.mu.Lock()
+			if processes, running := spv.programs[name]; running {
+				if spv.manuallyStopped[name] == nil {
+					spv.manuallyStopped[name] = make(map[int]bool)
+				}
+				for id, p := range processes {
+					procs = append(procs, p)
+					spv.manuallyStopped[name][id] = true
+				}
+				delete(spv.programs, name)
+			}
+			spv.mu.Unlock()
+			for _, p := range procs {
+				if p != nil {
+					spv.StopProcess(p, name, &oldProgram)
+				}
+			}
+			if newProgram.Autostart {
+				spv.StartProgram(name, &newProgram)
+			}
+		}
+	}
+}
+
+// programsEqual compares critical fields to decide if a program definition changed
+func programsEqual(p1, p2 Program) bool {
+	return p1.Command == p2.Command &&
+		p1.NumProcs == p2.NumProcs &&
+		p1.Directory == p2.Directory &&
+		p1.Autostart == p2.Autostart &&
+		p1.Autorestart == p2.Autorestart &&
+		p1.StopSignal == p2.StopSignal
+}
+
+// Shutdown gracefully stops all running programs and waits for goroutines.
+func (spv *Supervisor) Shutdown() {
+	fmt.Println("[taskmaster] Graceful shutdown initiated")
+	spv.mu.Lock()
+	// Snapshot running processes
+	snapshot := make(map[string]map[int]*exec.Cmd)
+	for name, instances := range spv.programs {
+		snapshot[name] = make(map[int]*exec.Cmd)
+		for id, cmd := range instances {
+			snapshot[name][id] = cmd
+		}
+	}
+	spv.mu.Unlock()
+
+	// Stop processes outside lock
+	for name, instances := range snapshot {
+		progCfg, ok := spv.cfg.Programs[name]
+		if !ok { // program removed from config, build minimal config
+			progCfg = Program{StopSignal: "TERM", StopWaitSecs: 5}
+		}
+		for _, cmd := range instances {
+			if cmd != nil {
+				spv.StopProcess(cmd, name, &progCfg)
+			}
+		}
+	}
+
+	// Cancel context and wait for monitor goroutines
+	spv.cancel()
+	spv.wg.Wait()
+	if spv.logger != nil {
+		spv.logger.LogTaskmasterStop()
+		spv.logger.Close()
+	}
+	fmt.Println("[taskmaster] Shutdown complete")
+}
+
 // startSingleWorker creates and starts a single process instance
 // This is the core function that actually executes programs and sets up monitoring
 // Returns: PID of started process, the *exec.Cmd for management, and program name
