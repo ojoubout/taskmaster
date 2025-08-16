@@ -25,6 +25,7 @@ type Supervisor struct {
 	wg              sync.WaitGroup               // Wait group to track running goroutines
 	mu              sync.RWMutex                 // Read-Write mutex for thread-safe access to programs map
 	logger          *Logger                      // Logger for recording events
+	stateTracker    *StateTracker                // State tracker for comprehensive process monitoring
 }
 
 // NewSupervisor creates a new Supervisor instance with the given configuration
@@ -39,6 +40,7 @@ func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 		ctx:             ctx,
 		cancel:          cancel,
 		logger:          logger,
+		stateTracker:    NewStateTracker(logger), // Initialize state tracker
 	}
 }
 
@@ -46,6 +48,9 @@ func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 // This is the core function that actually executes programs and sets up monitoring
 // Returns: PID of started process, the *exec.Cmd for management, and program name
 func startSingleWorker(programName string, programConfig *Program, instanceID int, spv *Supervisor) (int, *exec.Cmd) {
+	// Update state to STARTING
+	spv.stateTracker.UpdateState(programName, instanceID, STARTING, "Attempting to start process")
+
 	// Step 1: Parse command string into program and arguments
 	// Example: "/bin/sleep 10" becomes ["/bin/sleep", "10"]
 	parts := strings.Fields(programConfig.Command)
@@ -158,6 +163,12 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			spv.logger.LogStartupFailure(programName, startAttempt, maxStartRetries, err)
 		}
 
+		// Update state to BACKOFF if this isn't the last attempt
+		if startAttempt < maxStartRetries {
+			spv.stateTracker.UpdateState(programName, instanceID, BACKOFF,
+				fmt.Sprintf("Start failed (attempt %d/%d): %v", startAttempt, maxStartRetries, err))
+		}
+
 		// If this wasn't the last attempt, wait before retrying
 		if startAttempt < maxStartRetries {
 			retryDelay := 1 * time.Second
@@ -166,9 +177,12 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			select {
 			case <-spv.ctx.Done():
 				// Supervisor is shutting down, don't retry
+				spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Supervisor shutting down")
 				return 0, nil
 			case <-time.After(retryDelay):
 				// Delay completed, continue to next attempt
+				spv.stateTracker.UpdateState(programName, instanceID, STARTING,
+					fmt.Sprintf("Retrying start (attempt %d/%d)", startAttempt+1, maxStartRetries))
 			}
 		}
 	}
@@ -177,6 +191,8 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	if err != nil {
 		fmt.Printf("[taskmaster] Failed to start %s after %d attempts, giving up\n",
 			programConfig.Command, maxStartRetries)
+		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
+			fmt.Sprintf("Failed to start after %d attempts: %v", maxStartRetries, err))
 		return 0, nil // Return 0 PID and nil cmd to indicate failure
 	}
 
@@ -185,6 +201,17 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	fmt.Printf("[taskmaster] Started %s with PID %d\n", programConfig.Command, pid)
 	if spv.logger != nil {
 		spv.logger.LogProgramStart(programName, pid, programConfig.Command)
+	}
+
+	// Update state tracker with successful start - but keep in STARTING state until startsecs validation
+	spv.stateTracker.SetPID(programName, instanceID, pid)
+	// Always start in STARTING state - the monitoring goroutine will transition to RUNNING
+	if programConfig.StartSecs > 0 {
+		spv.stateTracker.UpdateState(programName, instanceID, STARTING,
+			fmt.Sprintf("Started, checking for %d seconds", programConfig.StartSecs))
+	} else {
+		spv.stateTracker.UpdateState(programName, instanceID, STARTING,
+			"Started, checking process")
 	}
 
 	// Step 9: Define cleanup function for file handles
@@ -214,21 +241,21 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		// In supervisor, processes that exit before startsecs are considered unexpected exits
 		var processExitErr error
 		var survivedStartsecs bool = true // Track if process survived startsecs
-		
+
 		if programConfig.StartSecs > 0 {
 			fmt.Printf("[taskmaster] Process %d must run for %d seconds to be considered started\n", pid, programConfig.StartSecs)
-			
+
 			// Create channels for communication between goroutines
 			processExited := make(chan struct{})
 			startupTimer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
 			defer startupTimer.Stop()
-			
+
 			// Start a goroutine to wait for process exit
 			go func() {
 				processExitErr = cmd.Wait()
 				close(processExited)
 			}()
-			
+
 			// Race between startup timer and process exit
 			select {
 			case <-spv.ctx.Done():
@@ -240,7 +267,11 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				if spv.logger != nil {
 					spv.logger.Info("Process %d (%s) successfully started after %d seconds", pid, programName, programConfig.StartSecs)
 				}
-				
+
+				// Update state to confirm running status after startsecs validation
+				spv.stateTracker.UpdateState(programName, instanceID, RUNNING,
+					"Process started successfully")
+
 				// Now wait for the process to actually exit
 				<-processExited
 			case <-processExited:
@@ -250,11 +281,17 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				if spv.logger != nil {
 					spv.logger.Warn("Process %d (%s) exited before startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
 				}
+
+				// Update state to indicate early exit
+				spv.stateTracker.UpdateState(programName, instanceID, EXITED,
+					fmt.Sprintf("Process exited before %d second startup validation", programConfig.StartSecs))
 			}
 		} else {
-			// No startsecs validation required
+			// No startsecs validation required - transition to RUNNING after brief STARTING state
 			fmt.Printf("[taskmaster] Process %d started (no startsecs validation)\n", pid)
-			
+			spv.stateTracker.UpdateState(programName, instanceID, RUNNING,
+				"Process started successfully")
+
 			// Wait for process to exit
 			processExitErr = cmd.Wait()
 		}
@@ -294,6 +331,16 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
 		}
 
+		// Update state tracker with exit information
+		spv.stateTracker.SetExitStatus(programName, instanceID, exitCode, expected)
+		if expected {
+			spv.stateTracker.UpdateState(programName, instanceID, EXITED,
+				fmt.Sprintf("Process exited normally with code %d", exitCode))
+		} else {
+			spv.stateTracker.UpdateState(programName, instanceID, EXITED,
+				fmt.Sprintf("Process exited unexpectedly with code %d", exitCode))
+		}
+
 		// Step 10c: Handle restart logic based on autorestart policy
 		// Note: startsecs doesn't prevent restarts in supervisor
 		spv.handleProcessRestart(programName, programConfig, instanceID, expected, exitCode)
@@ -319,6 +366,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 
 	if manualStop {
 		fmt.Printf("[taskmaster] Program %s (instance %d) was manually stopped, not restarting\n", programName, instanceID)
+		spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Process manually stopped")
 		// Remove from tracking since it won't be restarted
 		spv.mu.Lock()
 		if spv.programs[programName] != nil {
@@ -358,7 +406,10 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	}
 
 	if !shouldRestart {
-		// Remove the process from tracking since it won't be restarted
+		// Process exited and won't be restarted - leave it in EXITED state
+		// Don't change state to STOPPED since it wasn't manually stopped
+		fmt.Printf("[taskmaster] Program %s (instance %d) will remain in EXITED state (policy: %s)\n", 
+			programName, instanceID, programConfig.Autorestart)
 		spv.mu.Lock()
 		if spv.programs[programName] != nil {
 			delete(spv.programs[programName], instanceID)
@@ -386,6 +437,10 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v\n",
 		programName, instanceID, restartDelay)
 
+	// Update state to indicate restart is pending
+	spv.stateTracker.UpdateState(programName, instanceID, BACKOFF,
+		fmt.Sprintf("Waiting %v before restart", restartDelay))
+
 	// Log the restart attempt
 	if spv.logger != nil {
 		spv.logger.LogProgramRestart(programName, "autorestart")
@@ -395,6 +450,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	select {
 	case <-spv.ctx.Done():
 		// Supervisor is shutting down, don't restart
+		spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Supervisor shutting down")
 		return
 	case <-time.After(restartDelay):
 		// Delay completed, proceed with restart
@@ -435,9 +491,12 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	}
 	spv.mu.Unlock()
 
-	// Start the specified number of processes (numprocs)
+	// Register all process instances in the state tracker and start them
 	// Each process gets an instance ID: 0, 1, 2, etc.
 	for i := 0; i < programConfig.NumProcs; i++ {
+		// Register the process in state tracker before starting
+		spv.stateTracker.RegisterProcess(programName, i, programConfig)
+
 		pid, cmd := startSingleWorker(programName, programConfig, i, spv)
 		if cmd != nil {
 			// Store the command in our tracking map
@@ -477,6 +536,7 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 	}
 	for instanceID := range processes {
 		spv.manuallyStopped[programName][instanceID] = true
+		spv.stateTracker.UpdateState(programName, instanceID, STOPPING, "Manual stop requested")
 		fmt.Printf("[taskmaster] Marking program %s (instance %d) as manually stopped\n", programName, instanceID)
 	}
 	spv.mu.Unlock()
@@ -496,6 +556,31 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 	// Remove from running programs map
 	delete(spv.programs, programName)
 	return nil
+}
+
+// GetProcessState returns the current state of a specific process instance
+func (spv *Supervisor) GetProcessState(programName string, instanceID int) (*ProcessInfo, bool) {
+	return spv.stateTracker.GetProcessInfo(programName, instanceID)
+}
+
+// GetAllProcessStates returns the current state of all tracked processes
+func (spv *Supervisor) GetAllProcessStates() map[string]*ProcessInfo {
+	return spv.stateTracker.GetAllProcesses()
+}
+
+// GetProgramStates returns all instances of a specific program
+func (spv *Supervisor) GetProgramStates(programName string) []*ProcessInfo {
+	return spv.stateTracker.GetProcessesByName(programName)
+}
+
+// IsProcessRunning checks if a specific process instance is running
+func (spv *Supervisor) IsProcessRunning(programName string, instanceID int) bool {
+	return spv.stateTracker.IsProcessRunning(programName, instanceID)
+}
+
+// GetRunningCount returns the number of running instances for a program
+func (spv *Supervisor) GetRunningCount(programName string) int {
+	return spv.stateTracker.GetRunningCount(programName)
 }
 
 // StopProcess gracefully stops a process using the configured stop signal
@@ -552,17 +637,17 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	// Use a goroutine to wait for process exit
 	done := make(chan error, 1)
 	go func() {
-	// Poll the process to see if it's still running instead of calling Wait()
-	// since the monitoring goroutine is already calling Wait()
-	for {
-	err := cmd.Process.Signal(syscall.Signal(0))
-	if err != nil {
-	// Process no longer exists
-	done <- nil
-	return
-	}
-	time.Sleep(100 * time.Millisecond) // Check every 100ms
-	}
+		// Poll the process to see if it's still running instead of calling Wait()
+		// since the monitoring goroutine is already calling Wait()
+		for {
+			err := cmd.Process.Signal(syscall.Signal(0))
+			if err != nil {
+				// Process no longer exists
+				done <- nil
+				return
+			}
+			time.Sleep(100 * time.Millisecond) // Check every 100ms
+		}
 	}()
 
 	// Step 4: Race between timeout and process exit

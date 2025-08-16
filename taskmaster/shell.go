@@ -3,20 +3,18 @@
 package taskmaster
 
 import (
-	"bufio"    // For buffered I/O operations (reading user input line by line)
-	"fmt"      // For formatted I/O operations (printing to console)
-	"os"       // For operating system interface (os.Stdin, os.Exit)
-	"strings"  // For string manipulation (splitting, trimming, etc.)
-	"sync"     // For synchronization primitives (mutex for thread safety)
-	"syscall"  // For system calls (checking if process is running)
+	"bufio"   // For buffered I/O operations (reading user input line by line)
+	"fmt"     // For formatted I/O operations (printing to console)
+	"os"      // For operating system interface (os.Stdin, os.Exit)
+	"strings" // For string manipulation (splitting, trimming, etc.)
+	"time"    // For time duration formatting
 )
 
 // Shell represents the interactive command-line interface
 // It provides commands to control the supervisor and its programs
 type Shell struct {
-	supervisor *Supervisor   // Reference to the supervisor that manages processes
-	running    bool          // Flag to control the main shell loop
-	mu         sync.RWMutex  // Read-Write mutex for thread-safe access to running flag
+	supervisor *Supervisor // Reference to the supervisor that manages processes
+	running    bool        // Flag to control the main shell loop
 }
 
 // NewShell creates a new Shell instance with the given supervisor
@@ -24,7 +22,29 @@ type Shell struct {
 func NewShell(supervisor *Supervisor) *Shell {
 	return &Shell{
 		supervisor: supervisor,
-		running:    true,  // Start in running state
+		running:    true, // Start in running state
+	}
+}
+
+// formatDuration formats a duration into a human-readable string
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd %02d:%02d:%02d", days, hours, minutes, seconds)
+	} else if hours > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%02d:%02d", minutes, seconds)
+	} else {
+		return fmt.Sprintf("%ds", seconds)
 	}
 }
 
@@ -32,29 +52,29 @@ func NewShell(supervisor *Supervisor) *Shell {
 // This function blocks until the user types 'quit' or 'exit'
 func (s *Shell) Start() {
 	fmt.Println("Taskmaster control shell started. Type 'help' for commands.")
-	
+
 	// Create a scanner to read user input line by line
 	scanner := bufio.NewScanner(os.Stdin)
-	
+
 	// Main shell loop - continues until s.running becomes false
 	for s.running {
-		fmt.Print("taskmaster> ")  // Show prompt
-		
+		fmt.Print("taskmaster> ") // Show prompt
+
 		// Read next line of input from user
 		if !scanner.Scan() {
-			break  // Exit if there's an error or EOF (Ctrl+D)
+			break // Exit if there's an error or EOF (Ctrl+D)
 		}
-		
+
 		// Get the command text and remove leading/trailing whitespace
 		command := strings.TrimSpace(scanner.Text())
 		if command == "" {
-			continue  // Skip empty lines
+			continue // Skip empty lines
 		}
-		
+
 		// Process the command
 		s.processCommand(command)
 	}
-	
+
 	// Check if there was an error reading input
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error reading input: %v\n", err)
@@ -65,15 +85,15 @@ func (s *Shell) Start() {
 // Commands are space-separated: "start program_name" becomes ["start", "program_name"]
 func (s *Shell) processCommand(command string) {
 	// Split command into parts (command and arguments)
-	parts := strings.Fields(command)  // Fields splits on any whitespace
+	parts := strings.Fields(command) // Fields splits on any whitespace
 	if len(parts) == 0 {
 		return
 	}
-	
+
 	// First part is the command, rest are arguments
-	cmd := strings.ToLower(parts[0])  // Convert to lowercase for case-insensitive matching
-	args := parts[1:]                 // Slice from index 1 to end (excludes first element)
-	
+	cmd := strings.ToLower(parts[0]) // Convert to lowercase for case-insensitive matching
+	args := parts[1:]                // Slice from index 1 to end (excludes first element)
+
 	// Route to appropriate handler based on command
 	switch cmd {
 	case "help", "h":
@@ -111,58 +131,48 @@ func (s *Shell) showHelp() {
 // If no arguments are provided, shows all programs
 // If a program name is provided, shows detailed info for that program
 func (s *Shell) showStatus(args []string) {
-	// Lock supervisor for reading to ensure thread safety
-	s.supervisor.mu.RLock()
-	defer s.supervisor.mu.RUnlock()  // Unlock when function returns
-	
 	if len(args) == 0 {
-		// Show status of all programs in a table format
-		fmt.Printf("%-15s %-10s %-8s %-s\n", "PROGRAM", "STATUS", "PID", "COMMAND")
-		fmt.Println(strings.Repeat("-", 60))  // Print separator line
-		
-		// Iterate through all configured programs
-		for name, program := range s.supervisor.cfg.Programs {
-			processes, exists := s.supervisor.programs[name]
-			
-			// If program has no running processes, show as STOPPED
-			if !exists || len(processes) == 0 {
-				fmt.Printf("%-15s %-10s %-8s %-s\n", name, "STOPPED", "-", program.Command)
-				continue
-			}
-			
-			// Show each running process (for programs with numprocs > 1)
-			for i, proc := range processes {
-				status := "UNKNOWN"
-				pid := "-"
-				
-				if proc != nil && proc.Process != nil {
-					pid = fmt.Sprintf("%d", proc.Process.Pid)
-					
-					// Check if process is still running using signal 0
-					// Signal 0 doesn't actually send a signal, just checks if process exists
-					if proc.ProcessState == nil {
-						// Process hasn't exited yet, verify it's actually running
-						err := proc.Process.Signal(syscall.Signal(0))
-						if err == nil {
-							status = "RUNNING"
-						} else {
-							status = "STOPPED"
-						}
-					} else {
-						status = "EXITED"
+		// Show status of all programs in a supervisor-like table format
+		fmt.Printf("%-20s %-12s %-8s %-12s %-8s %-s\n", "PROGRAM", "STATE", "PID", "UPTIME", "RETRIES", "DESCRIPTION")
+		fmt.Println(strings.Repeat("-", 80)) // Print separator line
+
+		// Get all process states from the state tracker
+		allProcesses := s.supervisor.GetAllProcessStates()
+
+		// If no processes are tracked, show configured programs as STOPPED
+		if len(allProcesses) == 0 {
+			for name, program := range s.supervisor.cfg.Programs {
+				for i := 0; i < program.NumProcs; i++ {
+					programName := name
+					if program.NumProcs > 1 {
+						programName = fmt.Sprintf("%s:%d", name, i)
 					}
-				} else {
-					status = "STOPPED"
+					fmt.Printf("%-20s %-12s %-8s %-12s %-8s %-s\n",
+						programName, "STOPPED", "-", "-", "-", "Not started")
 				}
-				
-				// For multiple processes, append index to name (program_0, program_1, etc.)
-				programName := name
-				if i > 0 {
-					programName = fmt.Sprintf("%s_%d", name, i)
-				}
-				
-				fmt.Printf("%-15s %-10s %-8s %-s\n", programName, status, pid, program.Command)
 			}
+			return
+		}
+
+		// Display tracked processes
+		for _, info := range allProcesses {
+			programName := info.Name
+			if info.InstanceID > 0 {
+				programName = fmt.Sprintf("%s:%d", info.Name, info.InstanceID)
+			}
+
+			pid := "-"
+			if info.PID > 0 {
+				pid = fmt.Sprintf("%d", info.PID)
+			}
+
+			uptime := "-"
+			if info.State == RUNNING && info.Uptime > 0 {
+				uptime = formatDuration(info.Uptime)
+			}
+
+			fmt.Printf("%-20s %-12s %-8s %-12s %-8d %s\n",
+				programName, info.State.String(), pid, uptime, info.Retries, info.Description)
 		}
 	} else {
 		// Show detailed status of specific program
@@ -172,26 +182,46 @@ func (s *Shell) showStatus(args []string) {
 			fmt.Printf("Program '%s' not found in configuration.\n", programName)
 			return
 		}
-		
-		processes, running := s.supervisor.programs[programName]
+
+		// Get all instances of this program
+		processes := s.supervisor.GetProgramStates(programName)
+
 		fmt.Printf("Program: %s\n", programName)
 		fmt.Printf("Command: %s\n", program.Command)
 		fmt.Printf("NumProcs: %d\n", program.NumProcs)
 		fmt.Printf("Autostart: %t\n", program.Autostart)
 		fmt.Printf("Autorestart: %s\n", program.Autorestart)
-		
-		if !running || len(processes) == 0 {
-			fmt.Println("Status: STOPPED")
+		fmt.Printf("StartRetries: %d\n", program.StartRetries)
+		fmt.Printf("StartSecs: %d\n", program.StartSecs)
+		fmt.Printf("StopSignal: %s\n", program.StopSignal)
+		fmt.Printf("StopWaitSecs: %d\n", program.StopWaitSecs)
+		fmt.Printf("Expected Exit Codes: %v\n", program.ExitCodes)
+		fmt.Printf("\nInstances:\n")
+
+		if len(processes) == 0 {
+			fmt.Printf("  No instances tracked (program may not have been started)\n")
 		} else {
-			fmt.Printf("Running processes: %d\n", len(processes))
-			for i, proc := range processes {
-				if proc != nil && proc.Process != nil {
-					status := "RUNNING"
-					if proc.ProcessState != nil {
-						status = "EXITED"
-					}
-					fmt.Printf("  Process %d: PID %d, Status: %s\n", i, proc.Process.Pid, status)
+			for _, info := range processes {
+				fmt.Printf("  Instance %d:\n", info.InstanceID)
+				fmt.Printf("    State: %s\n", info.State.String())
+				fmt.Printf("    Description: %s\n", info.Description)
+				if info.PID > 0 {
+					fmt.Printf("    PID: %d\n", info.PID)
 				}
+				if info.State == RUNNING && info.Uptime > 0 {
+					fmt.Printf("    Uptime: %s\n", formatDuration(info.Uptime))
+				}
+				if !info.StartTime.IsZero() {
+					fmt.Printf("    Start Time: %s\n", info.StartTime.Format("2006-01-02 15:04:05"))
+				}
+				if !info.StopTime.IsZero() {
+					fmt.Printf("    Stop Time: %s\n", info.StopTime.Format("2006-01-02 15:04:05"))
+				}
+				fmt.Printf("    Retries: %d/%d\n", info.Retries, info.MaxRetries)
+				if info.ExitStatus != 0 {
+					fmt.Printf("    Last Exit Status: %d (expected: %v)\n", info.ExitStatus, info.ExpectedExit)
+				}
+				fmt.Println()
 			}
 		}
 	}
@@ -203,24 +233,24 @@ func (s *Shell) startProgram(args []string) {
 		fmt.Println("Usage: start <program>")
 		return
 	}
-	
+
 	programName := args[0]
 	program, exists := s.supervisor.cfg.Programs[programName]
 	if !exists {
 		fmt.Printf("Program '%s' not found in configuration.\n", programName)
 		return
 	}
-	
+
 	// Check if already running (without holding lock)
 	s.supervisor.mu.RLock()
 	processes, running := s.supervisor.programs[programName]
 	s.supervisor.mu.RUnlock()
-	
+
 	if running && len(processes) > 0 {
 		fmt.Printf("Program '%s' is already running.\n", programName)
 		return
 	}
-	
+
 	fmt.Printf("Starting program '%s'...\n", programName)
 	// StartProgram handles its own locking
 	s.supervisor.StartProgram(programName, &program)
@@ -233,33 +263,33 @@ func (s *Shell) stopProgram(args []string) {
 		fmt.Println("Usage: stop <program>")
 		return
 	}
-	
+
 	programName := args[0]
 	program, exists := s.supervisor.cfg.Programs[programName]
 	if !exists {
 		fmt.Printf("Program '%s' not found in configuration.\n", programName)
 		return
 	}
-	
+
 	// Check if program is running (without holding lock)
 	s.supervisor.mu.RLock()
 	processes, running := s.supervisor.programs[programName]
 	s.supervisor.mu.RUnlock()
-	
+
 	if !running || len(processes) == 0 {
 		fmt.Printf("Program '%s' is not running.\n", programName)
 		return
 	}
-	
+
 	fmt.Printf("Stopping program '%s'...\n", programName)
-	
+
 	// StopProgram handles its own locking
 	err := s.supervisor.StopProgram(programName, &program)
 	if err != nil {
 		fmt.Printf("Error stopping program '%s': %v\n", programName, err)
 		return
 	}
-	
+
 	fmt.Printf("Program '%s' stopped.\n", programName)
 }
 
@@ -269,24 +299,24 @@ func (s *Shell) restartProgram(args []string) {
 		fmt.Println("Usage: restart <program>")
 		return
 	}
-	
+
 	programName := args[0]
 	_, exists := s.supervisor.cfg.Programs[programName]
 	if !exists {
 		fmt.Printf("Program '%s' not found in configuration.\n", programName)
 		return
 	}
-	
+
 	fmt.Printf("Restarting program '%s'...\n", programName)
-	
+
 	// Log the restart event
 	if s.supervisor.logger != nil {
 		s.supervisor.logger.LogProgramRestart(programName, "manual restart")
 	}
-	
+
 	// Stop first
 	s.stopProgram(args)
-	
+
 	// Small delay to ensure cleanup (visual feedback)
 	fmt.Print("Waiting for cleanup...")
 	for i := 0; i < 3; i++ {
@@ -295,7 +325,7 @@ func (s *Shell) restartProgram(args []string) {
 		// In a real implementation, you might want a small delay here
 	}
 	fmt.Println()
-	
+
 	// Start again
 	s.startProgram(args)
 }
@@ -304,7 +334,7 @@ func (s *Shell) restartProgram(args []string) {
 // This implements hot-reloading of configuration without restarting taskmaster
 func (s *Shell) reloadConfig() {
 	fmt.Println("Reloading configuration...")
-	
+
 	// Load new config from file
 	newCfg, err := LoadConfig("taskmaster.conf")
 	if err != nil {
@@ -314,22 +344,22 @@ func (s *Shell) reloadConfig() {
 		}
 		return
 	}
-	
+
 	s.supervisor.mu.Lock()
 	defer s.supervisor.mu.Unlock()
-	
+
 	// Keep reference to old config for comparison
 	oldCfg := s.supervisor.cfg
 	s.supervisor.cfg = newCfg
-	
+
 	// Handle differences between old and new config
 	s.handleConfigChanges(oldCfg, newCfg)
-	
+
 	// Log successful reload
 	if s.supervisor.logger != nil {
 		s.supervisor.logger.LogConfigReload(true, "")
 	}
-	
+
 	fmt.Println("Configuration reloaded successfully.")
 }
 
@@ -351,11 +381,11 @@ func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
 			}
 		}
 	}
-	
+
 	// Step 2: Handle new programs and modified programs
 	for name, newProgram := range newCfg.Programs {
 		oldProgram, existed := oldCfg.Programs[name]
-		
+
 		if !existed {
 			// This is a completely new program
 			fmt.Printf("Starting new program: %s\n", name)
@@ -373,7 +403,7 @@ func (s *Shell) handleConfigChanges(oldCfg, newCfg *Config) {
 				}
 			}
 			delete(s.supervisor.programs, name)
-			
+
 			if newProgram.Autostart {
 				s.supervisor.StartProgram(name, &newProgram)
 			}
@@ -392,7 +422,7 @@ func programsEqual(p1, p2 Program) bool {
 		p1.Autostart == p2.Autostart &&
 		p1.Autorestart == p2.Autorestart &&
 		p1.StopSignal == p2.StopSignal
-	// Note: We don't compare all fields (like stdout/stderr paths) 
+	// Note: We don't compare all fields (like stdout/stderr paths)
 	// since some changes might not require a restart
 }
 
@@ -400,17 +430,17 @@ func programsEqual(p1, p2 Program) bool {
 // This stops all running programs and exits the application
 func (s *Shell) quit() {
 	fmt.Println("Shutting down taskmaster...")
-	s.running = false  // Stop the shell loop
-	
+	s.running = false // Stop the shell loop
+
 	// Log taskmaster shutdown
 	if s.supervisor.logger != nil {
 		s.supervisor.logger.LogTaskmasterStop()
 	}
-	
+
 	// Stop all programs before exiting
 	s.supervisor.mu.Lock()
 	defer s.supervisor.mu.Unlock()
-	
+
 	// Iterate through all running programs and stop them
 	for name, processes := range s.supervisor.programs {
 		program := s.supervisor.cfg.Programs[name]
@@ -421,15 +451,15 @@ func (s *Shell) quit() {
 			}
 		}
 	}
-	
+
 	// Cancel supervisor context to stop monitoring goroutines
 	s.supervisor.cancel()
-	
+
 	// Close the logger
 	if s.supervisor.logger != nil {
 		s.supervisor.logger.Close()
 	}
-	
+
 	fmt.Println("Goodbye!")
-	os.Exit(0)  // Exit the entire application
+	os.Exit(0) // Exit the entire application
 }
