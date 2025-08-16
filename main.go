@@ -62,6 +62,6 @@ func main() {
 
 	// Step 9: Start the interactive control shell
 	// This provides a command-line interface for managing processes (start, stop, status, etc.)
-	shell := taskmaster.NewShell(supervisor)
+	shell := taskmaster.NewShell(supervisor, configFile)
 	shell.Start() // This blocks and runs the interactive shell until user quits
 }

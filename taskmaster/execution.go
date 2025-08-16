@@ -28,6 +28,56 @@ type Supervisor struct {
 	stateTracker    *StateTracker                // State tracker for comprehensive process monitoring
 }
 
+// ---------------- Helper functions to reduce duplication ----------------
+
+// effectiveRetries returns a positive retry count (default 3) for a program.
+func (spv *Supervisor) effectiveRetries(p *Program) int {
+	if p.StartRetries > 0 {
+		return p.StartRetries
+	}
+	return 3
+}
+
+// markProgramInstancesManuallyStopped marks all instances of a program as manually stopped with a reason.
+func (spv *Supervisor) markProgramInstancesManuallyStopped(programName string, processes map[int]*exec.Cmd, reason string) {
+	if processes == nil {
+		return
+	}
+	if spv.manuallyStopped[programName] == nil {
+		spv.manuallyStopped[programName] = make(map[int]bool)
+	}
+	for id := range processes {
+		spv.manuallyStopped[programName][id] = true
+		if reason != "" {
+			spv.stateTracker.UpdateState(programName, id, STOPPING, reason)
+		}
+	}
+}
+
+// detachProgram removes a program from tracking and returns its processes snapshot (not thread-safe by itself).
+func (spv *Supervisor) detachProgram(programName string) map[int]*exec.Cmd {
+	processes, ok := spv.programs[programName]
+	if !ok {
+		return nil
+	}
+	snapshot := make(map[int]*exec.Cmd, len(processes))
+	for id, cmd := range processes {
+		snapshot[id] = cmd
+	}
+	delete(spv.programs, programName)
+	return snapshot
+}
+
+// removeProgramInstance removes a single instance; cleans program if empty.
+func (spv *Supervisor) removeProgramInstance(programName string, instanceID int) {
+	if inst, ok := spv.programs[programName]; ok {
+		delete(inst, instanceID)
+		if len(inst) == 0 {
+			delete(spv.programs, programName)
+		}
+	}
+}
+
 // NewSupervisor creates a new Supervisor instance with the given configuration
 // It initializes the context for cancellation and the programs tracking map
 func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
@@ -79,23 +129,12 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 			continue
 		}
 		fmt.Printf("[taskmaster] Removing program %s\n", name)
-		var procs []*exec.Cmd
-		var oldProgram Program
 		spv.mu.Lock()
-		if processes, running := spv.programs[name]; running {
-			if spv.manuallyStopped[name] == nil {
-				spv.manuallyStopped[name] = make(map[int]bool)
-			}
-			oldProgram = oldCfg.Programs[name]
-			for id, p := range processes {
-				procs = append(procs, p)
-				spv.manuallyStopped[name][id] = true
-			}
-			delete(spv.programs, name)
-		}
+		oldProgram := oldCfg.Programs[name]
+		procsMap := spv.detachProgram(name)
+		spv.markProgramInstancesManuallyStopped(name, procsMap, "Removed by config reload")
 		spv.mu.Unlock()
-
-		for _, p := range procs {
+		for _, p := range procsMap {
 			if p != nil {
 				spv.StopProcess(p, name, &oldProgram)
 			}
@@ -114,20 +153,11 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 		}
 		if !programsEqual(oldProgram, newProgram) {
 			fmt.Printf("[taskmaster] Restarting modified program %s\n", name)
-			var procs []*exec.Cmd
 			spv.mu.Lock()
-			if processes, running := spv.programs[name]; running {
-				if spv.manuallyStopped[name] == nil {
-					spv.manuallyStopped[name] = make(map[int]bool)
-				}
-				for id, p := range processes {
-					procs = append(procs, p)
-					spv.manuallyStopped[name][id] = true
-				}
-				delete(spv.programs, name)
-			}
+			procsMap := spv.detachProgram(name)
+			spv.markProgramInstancesManuallyStopped(name, procsMap, "Config change restart")
 			spv.mu.Unlock()
-			for _, p := range procs {
+			for _, p := range procsMap {
 				if p != nil {
 					spv.StopProcess(p, name, &oldProgram)
 				}
@@ -153,25 +183,23 @@ func programsEqual(p1, p2 Program) bool {
 func (spv *Supervisor) Shutdown() {
 	fmt.Println("[taskmaster] Graceful shutdown initiated")
 	spv.mu.Lock()
-	// Snapshot running processes
-	snapshot := make(map[string]map[int]*exec.Cmd)
-	for name, instances := range spv.programs {
-		snapshot[name] = make(map[int]*exec.Cmd)
-		for id, cmd := range instances {
-			snapshot[name][id] = cmd
-		}
+	all := make(map[string]map[int]*exec.Cmd, len(spv.programs))
+	for name := range spv.programs {
+		all[name] = spv.detachProgram(name)
+	}
+	for name, procs := range all {
+		spv.markProgramInstancesManuallyStopped(name, procs, "Supervisor shutdown")
 	}
 	spv.mu.Unlock()
 
-	// Stop processes outside lock
-	for name, instances := range snapshot {
-		progCfg, ok := spv.cfg.Programs[name]
-		if !ok { // program removed from config, build minimal config
-			progCfg = Program{StopSignal: "TERM", StopWaitSecs: 5}
+	for name, procs := range all {
+		cfg, ok := spv.cfg.Programs[name]
+		if !ok {
+			cfg = Program{StopSignal: "TERM", StopWaitSecs: 5}
 		}
-		for _, cmd := range instances {
-			if cmd != nil {
-				spv.StopProcess(cmd, name, &progCfg)
+		for _, c := range procs {
+			if c != nil {
+				spv.StopProcess(c, name, &cfg)
 			}
 		}
 	}
@@ -243,10 +271,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
 
 	// Step 7: Actually start the process with retry logic
-	maxStartRetries := programConfig.StartRetries
-	if maxStartRetries <= 0 {
-		maxStartRetries = 3 // Default retry count if not specified
-	}
+	maxStartRetries := spv.effectiveRetries(programConfig)
 
 	var err error
 	var startAttempt int
@@ -511,12 +536,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Process manually stopped")
 		// Remove from tracking since it won't be restarted
 		spv.mu.Lock()
-		if spv.programs[programName] != nil {
-			delete(spv.programs[programName], instanceID)
-			if len(spv.programs[programName]) == 0 {
-				delete(spv.programs, programName)
-			}
-		}
+		spv.removeProgramInstance(programName, instanceID)
 		spv.mu.Unlock()
 		return
 	}
@@ -553,13 +573,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		fmt.Printf("[taskmaster] Program %s (instance %d) will remain in EXITED state (policy: %s)\n",
 			programName, instanceID, programConfig.Autorestart)
 		spv.mu.Lock()
-		if spv.programs[programName] != nil {
-			delete(spv.programs[programName], instanceID)
-			// If no more instances, remove the program entirely
-			if len(spv.programs[programName]) == 0 {
-				delete(spv.programs, programName)
-			}
-		}
+		spv.removeProgramInstance(programName, instanceID)
 		spv.mu.Unlock()
 		return
 	}
@@ -587,13 +601,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 
 		// Remove from tracking since it won't be restarted
 		spv.mu.Lock()
-		if spv.programs[programName] != nil {
-			delete(spv.programs[programName], instanceID)
-			if len(spv.programs[programName]) == 0 {
-				delete(spv.programs, programName)
-			}
-		}
-		// Clean up retry count for this instance
+		spv.removeProgramInstance(programName, instanceID)
 		if spv.retryCount[programName] != nil {
 			delete(spv.retryCount[programName], instanceID)
 			if len(spv.retryCount[programName]) == 0 {
@@ -711,34 +719,19 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 	if !running || len(processes) == 0 {
 		return fmt.Errorf("program '%s' is not running", programName)
 	}
-
-	// Mark all instances as manually stopped before stopping them
-	// This prevents autorestart when the processes exit
 	spv.mu.Lock()
-	if spv.manuallyStopped[programName] == nil {
-		spv.manuallyStopped[programName] = make(map[int]bool)
-	}
-	for instanceID := range processes {
-		spv.manuallyStopped[programName][instanceID] = true
-		spv.stateTracker.UpdateState(programName, instanceID, STOPPING, "Manual stop requested")
-		fmt.Printf("[taskmaster] Marking program %s (instance %d) as manually stopped\n", programName, instanceID)
-	}
+	spv.markProgramInstancesManuallyStopped(programName, processes, "Manual stop requested")
+	procs := spv.detachProgram(programName)
 	spv.mu.Unlock()
-
-	// Stop each running process
-	for _, proc := range processes {
+	for _, proc := range procs {
 		if proc != nil {
-			err := spv.StopProcess(proc, programName, programConfig)
-			if err != nil {
+			if err := spv.StopProcess(proc, programName, programConfig); err != nil {
 				if spv.logger != nil {
 					spv.logger.LogError("stopping program "+programName, err)
 				}
 			}
 		}
 	}
-
-	// Remove from running programs map
-	delete(spv.programs, programName)
 	return nil
 }
 

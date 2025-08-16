@@ -344,34 +344,9 @@ func (s *Shell) quit() {
 	fmt.Println("Shutting down taskmaster...")
 	s.running = false // Stop the shell loop
 
-	// Log taskmaster shutdown
-	if s.supervisor.logger != nil {
-		s.supervisor.logger.LogTaskmasterStop()
-	}
-
-	// Stop all programs before exiting
-	s.supervisor.mu.Lock()
-	defer s.supervisor.mu.Unlock()
-
-	// Iterate through all running programs and stop them
-	for name, processes := range s.supervisor.programs {
-		program := s.supervisor.cfg.Programs[name]
-		fmt.Printf("Stopping program: %s\n", name)
-		for _, proc := range processes {
-			if proc != nil {
-				s.supervisor.StopProcess(proc, name, &program)
-			}
-		}
-	}
-
-	// Cancel supervisor context to stop monitoring goroutines
-	s.supervisor.cancel()
-
-	// Close the logger
-	if s.supervisor.logger != nil {
-		s.supervisor.logger.Close()
-	}
+	// Delegate to centralized graceful shutdown
+	s.supervisor.Shutdown()
 
 	fmt.Println("Goodbye!")
-	os.Exit(0) // Exit the entire application
+	os.Exit(0)
 }
