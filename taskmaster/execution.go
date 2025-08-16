@@ -408,7 +408,7 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	if !shouldRestart {
 		// Process exited and won't be restarted - leave it in EXITED state
 		// Don't change state to STOPPED since it wasn't manually stopped
-		fmt.Printf("[taskmaster] Program %s (instance %d) will remain in EXITED state (policy: %s)\n", 
+		fmt.Printf("[taskmaster] Program %s (instance %d) will remain in EXITED state (policy: %s)\n",
 			programName, instanceID, programConfig.Autorestart)
 		spv.mu.Lock()
 		if spv.programs[programName] != nil {
@@ -427,19 +427,54 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	if spv.retryCount[programName] == nil {
 		spv.retryCount[programName] = make(map[int]int)
 	}
+
+	// Check current retry count for this instance
+	currentRetries := spv.retryCount[programName][instanceID]
+	maxRetries := programConfig.StartRetries
+	if maxRetries <= 0 {
+		maxRetries = 3 // Default retry count
+	}
 	spv.mu.Unlock()
 
-	// Runtime restarts are unlimited in supervisor - no retry limit
-	// Only controlled by autorestart policy and backoff delay
+	// Check if we've exceeded the retry limit
+	if currentRetries >= maxRetries {
+		fmt.Printf("[taskmaster] Program %s (instance %d) has exceeded retry limit (%d), entering FATAL state\n",
+			programName, instanceID, maxRetries)
+		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
+			fmt.Sprintf("Exceeded retry limit (%d attempts)", maxRetries))
+
+		// Remove from tracking since it won't be restarted
+		spv.mu.Lock()
+		if spv.programs[programName] != nil {
+			delete(spv.programs[programName], instanceID)
+			if len(spv.programs[programName]) == 0 {
+				delete(spv.programs, programName)
+			}
+		}
+		// Clean up retry count for this instance
+		if spv.retryCount[programName] != nil {
+			delete(spv.retryCount[programName], instanceID)
+			if len(spv.retryCount[programName]) == 0 {
+				delete(spv.retryCount, programName)
+			}
+		}
+		spv.mu.Unlock()
+		return
+	}
+
+	// Increment retry count for this restart attempt
+	spv.mu.Lock()
+	spv.retryCount[programName][instanceID] = currentRetries + 1
+	spv.mu.Unlock()
 
 	// Add a small delay before restarting to prevent rapid restart loops
 	restartDelay := 1 * time.Second
-	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v\n",
-		programName, instanceID, restartDelay)
+	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v (attempt %d/%d)\n",
+		programName, instanceID, restartDelay, currentRetries+1, maxRetries)
 
 	// Update state to indicate restart is pending
 	spv.stateTracker.UpdateState(programName, instanceID, BACKOFF,
-		fmt.Sprintf("Waiting %v before restart", restartDelay))
+		fmt.Sprintf("Waiting %v before restart (attempt %d/%d)", restartDelay, currentRetries+1, maxRetries))
 
 	// Log the restart attempt
 	if spv.logger != nil {
@@ -470,7 +505,8 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		fmt.Printf("[taskmaster] Successfully restarted program %s (instance %d) with new PID %d\n", programName, instanceID, pid)
 	} else {
 		fmt.Printf("[taskmaster] Failed to restart program %s (instance %d)\n", programName, instanceID)
-		// The retry will be handled by the new process's monitoring goroutine if it fails again
+		// startSingleWorker already handles start failures and sets FATAL state if needed
+		// If startSingleWorker returns nil, the process is already in FATAL state
 	}
 }
 
@@ -488,6 +524,12 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	if spv.manuallyStopped[programName] != nil {
 		delete(spv.manuallyStopped, programName)
 		fmt.Printf("[taskmaster] Cleared manually stopped flags for program %s\n", programName)
+	}
+
+	// Reset retry counts for manual start - give the program a fresh chance
+	if spv.retryCount[programName] != nil {
+		delete(spv.retryCount, programName)
+		fmt.Printf("[taskmaster] Reset retry counts for program %s (manual start)\n", programName)
 	}
 	spv.mu.Unlock()
 
