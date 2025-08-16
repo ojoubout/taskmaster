@@ -7,6 +7,7 @@ import (
 	"fmt"     // For formatted I/O operations (printing status messages)
 	"os"      // For file operations and process management
 	"os/exec" // For executing external programs
+	"sort"    // For sorting slices during comparison
 	"strings" // For string manipulation (splitting command arguments)
 	"sync"    // For synchronization primitives (WaitGroup, mutex)
 	"syscall" // For system calls (signals, umask)
@@ -170,13 +171,50 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 }
 
 // programsEqual compares critical fields to decide if a program definition changed
+// programsEqual determines if two program definitions are effectively identical
+// for purposes of deciding whether a running program must be restarted after a reload.
+// We include all fields that influence runtime behavior (mirroring supervisor's restart-on-change)
+// Excluded fields (if any) would be those that do not affect the already running process—currently none.
 func programsEqual(p1, p2 Program) bool {
-	return p1.Command == p2.Command &&
-		p1.NumProcs == p2.NumProcs &&
-		p1.Directory == p2.Directory &&
-		p1.Autostart == p2.Autostart &&
-		p1.Autorestart == p2.Autorestart &&
-		p1.StopSignal == p2.StopSignal
+	if p1.Command != p2.Command ||
+		p1.NumProcs != p2.NumProcs ||
+		p1.Directory != p2.Directory ||
+		p1.Autostart != p2.Autostart ||
+		p1.Autorestart != p2.Autorestart ||
+		p1.StopSignal != p2.StopSignal ||
+		p1.StopWaitSecs != p2.StopWaitSecs ||
+		p1.StartSecs != p2.StartSecs ||
+		p1.StartRetries != p2.StartRetries ||
+		p1.Umask != p2.Umask ||
+		p1.Stdout != p2.Stdout ||
+		p1.Stderr != p2.Stderr {
+		return false
+	}
+
+	// Compare ExitCodes ignoring order
+	if len(p1.ExitCodes) != len(p2.ExitCodes) {
+		return false
+	}
+	c1 := append([]int(nil), p1.ExitCodes...)
+	c2 := append([]int(nil), p2.ExitCodes...)
+	sort.Ints(c1)
+	sort.Ints(c2)
+	for i := range c1 {
+		if c1[i] != c2[i] {
+			return false
+		}
+	}
+
+	// Compare environment maps (size + each key/value)
+	if len(p1.Env) != len(p2.Env) {
+		return false
+	}
+	for k, v := range p1.Env {
+		if p2.Env[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // Shutdown gracefully stops all running programs and waits for goroutines.
