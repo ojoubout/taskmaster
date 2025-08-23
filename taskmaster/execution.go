@@ -506,22 +506,32 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 		// Determine exit code and whether it was expected
 		exitCode := 0
-		expected := true
+		expected := false // Default to false, must be proven expected
+		
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
 				exitCode = exitError.ExitCode()
 			}
-			// Check if this exit code is in the expected list
-			expected = false
-			for _, expectedCode := range programConfig.ExitCodes {
-				if exitCode == expectedCode {
-					expected = true
-					break
-				}
-			}
 			fmt.Printf("[taskmaster] Process %d exited with error: %v\n", pid, err)
 		} else {
-			fmt.Printf("[taskmaster] Process %d exited successfully\n", pid)
+			// Even successful exits (code 0) must be validated against expected codes
+			exitCode = 0
+			fmt.Printf("[taskmaster] Process %d exited with code 0\n", pid)
+		}
+		
+		// ALWAYS check if this exit code is in the expected list
+		for _, expectedCode := range programConfig.ExitCodes {
+			if exitCode == expectedCode {
+				expected = true
+				break
+			}
+		}
+		
+		if expected {
+			fmt.Printf("[taskmaster] Exit code %d is expected for program %s\n", exitCode, programName)
+		} else {
+			fmt.Printf("[taskmaster] Exit code %d is unexpected for program %s (expected: %v)\n", 
+				exitCode, programName, programConfig.ExitCodes)
 		}
 
 		// A process that exits before startsecs should be considered unexpected
