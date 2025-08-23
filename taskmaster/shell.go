@@ -149,40 +149,43 @@ func (s *Shell) showStatus(args []string) {
 		// Get all process states from the state tracker
 		allProcesses := s.supervisor.GetAllProcessStates()
 
-		// If no processes are tracked, show configured programs as STOPPED
-		if len(allProcesses) == 0 {
-			for name, program := range s.supervisor.cfg.Programs {
-				for i := 0; i < program.NumProcs; i++ {
-					programName := name
-					if program.NumProcs > 1 {
-						programName = fmt.Sprintf("%s:%d", name, i)
+		// Create a map for quick lookup of tracked processes
+		trackedProcesses := make(map[string]*ProcessInfo)
+		for _, info := range allProcesses {
+			key := fmt.Sprintf("%s:%d", info.Name, info.InstanceID)
+			trackedProcesses[key] = info
+		}
+
+		// Show ALL configured programs (whether tracked or not)
+		for name, program := range s.supervisor.cfg.Programs {
+			for i := 0; i < program.NumProcs; i++ {
+				programName := name
+				if program.NumProcs > 1 {
+					programName = fmt.Sprintf("%s_%02d", name, i)
+				}
+
+				// Look for tracked process info
+				key := fmt.Sprintf("%s:%d", name, i)
+				if info, exists := trackedProcesses[key]; exists {
+					// Show tracked process info
+					pid := "-"
+					if info.PID > 0 {
+						pid = fmt.Sprintf("%d", info.PID)
 					}
+
+					uptime := "-"
+					if info.State == RUNNING && info.Uptime > 0 {
+						uptime = formatDuration(info.Uptime)
+					}
+
+					fmt.Printf("%-20s %-12s %-8s %-12s %-8d %s\n",
+						programName, info.State.String(), pid, uptime, info.Retries, info.Description)
+				} else {
+					// Show as STOPPED if not tracked (never started or autostart=false)
 					fmt.Printf("%-20s %-12s %-8s %-12s %-8s %-s\n",
 						programName, "STOPPED", "-", "-", "-", "Not started")
 				}
 			}
-			return
-		}
-
-		// Display tracked processes
-		for _, info := range allProcesses {
-			programName := info.Name
-			if info.InstanceID > 0 {
-				programName = fmt.Sprintf("%s:%d", info.Name, info.InstanceID)
-			}
-
-			pid := "-"
-			if info.PID > 0 {
-				pid = fmt.Sprintf("%d", info.PID)
-			}
-
-			uptime := "-"
-			if info.State == RUNNING && info.Uptime > 0 {
-				uptime = formatDuration(info.Uptime)
-			}
-
-			fmt.Printf("%-20s %-12s %-8s %-12s %-8d %s\n",
-				programName, info.State.String(), pid, uptime, info.Retries, info.Description)
 		}
 	} else {
 		// Show detailed status of specific program
@@ -208,10 +211,16 @@ func (s *Shell) showStatus(args []string) {
 		fmt.Printf("Expected Exit Codes: %v\n", program.ExitCodes)
 		fmt.Printf("\nInstances:\n")
 
-		if len(processes) == 0 {
-			fmt.Printf("  No instances tracked (program may not have been started)\n")
-		} else {
-			for _, info := range processes {
+		// Create a map for quick lookup of tracked processes
+		trackedMap := make(map[int]*ProcessInfo)
+		for _, info := range processes {
+			trackedMap[info.InstanceID] = info
+		}
+
+		// Show all configured instances (tracked or not)
+		for i := 0; i < program.NumProcs; i++ {
+			if info, exists := trackedMap[i]; exists {
+				// Show tracked instance info
 				fmt.Printf("  Instance %d:\n", info.InstanceID)
 				fmt.Printf("    State: %s\n", info.State.String())
 				fmt.Printf("    Description: %s\n", info.Description)
@@ -231,6 +240,12 @@ func (s *Shell) showStatus(args []string) {
 				if info.ExitStatus != 0 {
 					fmt.Printf("    Last Exit Status: %d (expected: %v)\n", info.ExitStatus, info.ExpectedExit)
 				}
+				fmt.Println()
+			} else {
+				// Show untracked instance
+				fmt.Printf("  Instance %d:\n", i)
+				fmt.Printf("    State: STOPPED\n")
+				fmt.Printf("    Description: Not started\n")
 				fmt.Println()
 			}
 		}
