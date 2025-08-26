@@ -129,7 +129,9 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 		if _, exists := newCfg.Programs[name]; exists {
 			continue
 		}
-		fmt.Printf("[taskmaster] Removing program %s\n", name)
+		if spv.logger != nil {
+			spv.logger.Info("Removing program %s from configuration", name)
+		}
 		spv.mu.Lock()
 		oldProgram := oldCfg.Programs[name]
 		procsMap := spv.detachProgram(name)
@@ -147,13 +149,17 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 		oldProgram, existed := oldCfg.Programs[name]
 		if !existed {
 			if newProgram.Autostart {
-				fmt.Printf("[taskmaster] Starting new program %s\n", name)
+				if spv.logger != nil {
+					spv.logger.Info("Starting new program %s", name)
+				}
 				spv.StartProgram(name, &newProgram)
 			}
 			continue
 		}
 		if !programsEqual(oldProgram, newProgram) {
-			fmt.Printf("[taskmaster] Restarting modified program %s\n", name)
+			if spv.logger != nil {
+				spv.logger.Info("Restarting modified program %s", name)
+			}
 			spv.mu.Lock()
 			procsMap := spv.detachProgram(name)
 			spv.markProgramInstancesManuallyStopped(name, procsMap, "Config change restart")
@@ -219,7 +225,9 @@ func programsEqual(p1, p2 Program) bool {
 
 // Shutdown gracefully stops all running programs and waits for goroutines.
 func (spv *Supervisor) Shutdown() {
-	fmt.Println("[taskmaster] Graceful shutdown initiated")
+	if spv.logger != nil {
+		spv.logger.Info("Graceful shutdown initiated")
+	}
 	spv.mu.Lock()
 	all := make(map[string]map[int]*exec.Cmd, len(spv.programs))
 	for name := range spv.programs {
@@ -249,6 +257,7 @@ func (spv *Supervisor) Shutdown() {
 		spv.logger.LogTaskmasterStop()
 		spv.logger.Close()
 	}
+	// Keep this print as it's final user confirmation
 	fmt.Println("[taskmaster] Shutdown complete")
 }
 
@@ -283,7 +292,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		// 0644 means readable by owner/group/others, writable by owner only
 		stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			fmt.Printf("Failed to open stdout file %s: %v\n", programConfig.Stdout, err)
+			if spv.logger != nil {
+				spv.logger.Error("Failed to open stdout file %s: %v", programConfig.Stdout, err)
+			}
 		} else {
 			cmd.Stdout = stdoutFile // Redirect process stdout to file
 		}
@@ -293,7 +304,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	if programConfig.Stderr != "" {
 		stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			fmt.Printf("Failed to open stderr file %s: %v\n", programConfig.Stderr, err)
+			if spv.logger != nil {
+				spv.logger.Error("Failed to open stderr file %s: %v", programConfig.Stderr, err)
+			}
 		} else {
 			cmd.Stderr = stderrFile // Redirect process stderr to file
 		}
@@ -306,7 +319,7 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		defer syscall.Umask(oldUmask)                 // Restore old umask when function returns
 	}
 
-	fmt.Printf("[taskmaster] Starting program: %s\n", programConfig.Command)
+	// Log program startup - this is already done in LogProgramStart, so remove this print
 
 	// Step 7: Actually start the process with retry logic
 	maxStartRetries := spv.effectiveRetries(programConfig)
@@ -334,7 +347,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			if programConfig.Stdout != "" {
 				stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
-					fmt.Printf("Failed to open stdout file %s: %v\n", programConfig.Stdout, err)
+					if spv.logger != nil {
+						spv.logger.Error("Failed to open stdout file %s during retry: %v", programConfig.Stdout, err)
+					}
 				} else {
 					cmd.Stdout = stdoutFile
 				}
@@ -343,7 +358,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			if programConfig.Stderr != "" {
 				stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
-					fmt.Printf("Failed to open stderr file %s: %v\n", programConfig.Stderr, err)
+					if spv.logger != nil {
+						spv.logger.Error("Failed to open stderr file %s during retry: %v", programConfig.Stderr, err)
+					}
 				} else {
 					cmd.Stderr = stderrFile
 				}
@@ -362,8 +379,6 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		}
 
 		// Log the failed attempt
-		fmt.Printf("[taskmaster] Failed to start %s (attempt %d/%d): %v\n",
-			programConfig.Command, startAttempt, maxStartRetries, err)
 		if spv.logger != nil {
 			spv.logger.LogStartupFailure(programName, startAttempt, maxStartRetries, err)
 		}
@@ -377,7 +392,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		// If this wasn't the last attempt, wait before retrying
 		if startAttempt < maxStartRetries {
 			retryDelay := 1 * time.Second
-			fmt.Printf("[taskmaster] Retrying startup in %v...\n", retryDelay)
+			if spv.logger != nil {
+				spv.logger.Debug("Retrying startup in %v (attempt %d/%d)", retryDelay, startAttempt+1, maxStartRetries)
+			}
 
 			select {
 			case <-spv.ctx.Done():
@@ -394,8 +411,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 	// Check if all attempts failed
 	if err != nil {
-		fmt.Printf("[taskmaster] Failed to start %s after %d attempts, giving up\n",
-			programConfig.Command, maxStartRetries)
+		if spv.logger != nil {
+			spv.logger.Error("Failed to start %s after %d attempts, giving up", programConfig.Command, maxStartRetries)
+		}
 		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
 			fmt.Sprintf("Failed to start after %d attempts: %v", maxStartRetries, err))
 		return 0, nil // Return 0 PID and nil cmd to indicate failure
@@ -403,7 +421,6 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 	// Step 8: Get the PID and log success
 	pid := cmd.Process.Pid
-	fmt.Printf("[taskmaster] Started %s with PID %d\n", programConfig.Command, pid)
 	if spv.logger != nil {
 		spv.logger.LogProgramStart(programName, pid, programConfig.Command)
 	}
@@ -448,7 +465,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		var survivedStartsecs bool = true // Track if process survived startsecs
 
 		if programConfig.StartSecs > 0 {
-			fmt.Printf("[taskmaster] Process %d must run for %d seconds to be considered started\n", pid, programConfig.StartSecs)
+			if spv.logger != nil {
+				spv.logger.Debug("Process %d (%s) must run for %d seconds to be considered started", pid, programName, programConfig.StartSecs)
+			}
 
 			// Create channels for communication between goroutines
 			processExited := make(chan struct{})
@@ -468,9 +487,8 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				return
 			case <-startupTimer.C:
 				// Timer expired - process survived startsecs
-				fmt.Printf("[taskmaster] Process %d successfully started (survived %d seconds)\n", pid, programConfig.StartSecs)
 				if spv.logger != nil {
-					spv.logger.Info("Process %d (%s) successfully started after %d seconds", pid, programName, programConfig.StartSecs)
+					spv.logger.Debug("Process %d (%s) survived startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
 				}
 
 				// Update state to confirm running status after startsecs validation
@@ -482,7 +500,6 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			case <-processExited:
 				// Process exited before startsecs - this should be considered unexpected
 				survivedStartsecs = false
-				fmt.Printf("[taskmaster] Process %d exited before startsecs (%d seconds)\n", pid, programConfig.StartSecs)
 				if spv.logger != nil {
 					spv.logger.Warn("Process %d (%s) exited before startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
 				}
@@ -493,7 +510,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			}
 		} else {
 			// No startsecs validation required - transition to RUNNING after brief STARTING state
-			fmt.Printf("[taskmaster] Process %d started (no startsecs validation)\n", pid)
+			if spv.logger != nil {
+				spv.logger.Debug("Process %d (%s) started (no startsecs validation)", pid, programName)
+			}
 			spv.stateTracker.UpdateState(programName, instanceID, RUNNING,
 				"Process started successfully")
 
@@ -507,18 +526,22 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		// Determine exit code and whether it was expected
 		exitCode := 0
 		expected := false // Default to false, must be proven expected
-		
+
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
 				exitCode = exitError.ExitCode()
 			}
-			fmt.Printf("[taskmaster] Process %d exited with error: %v\n", pid, err)
+			if spv.logger != nil {
+				spv.logger.Debug("Process %d (%s) exited with error: %v", pid, programName, err)
+			}
 		} else {
 			// Even successful exits (code 0) must be validated against expected codes
 			exitCode = 0
-			fmt.Printf("[taskmaster] Process %d exited with code 0\n", pid)
+			if spv.logger != nil {
+				spv.logger.Debug("Process %d (%s) exited with code 0", pid, programName)
+			}
 		}
-		
+
 		// ALWAYS check if this exit code is in the expected list
 		for _, expectedCode := range programConfig.ExitCodes {
 			if exitCode == expectedCode {
@@ -526,19 +549,25 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				break
 			}
 		}
-		
+
 		if expected {
-			fmt.Printf("[taskmaster] Exit code %d is expected for program %s\n", exitCode, programName)
+			if spv.logger != nil {
+				spv.logger.Debug("Exit code %d is expected for program %s", exitCode, programName)
+			}
 		} else {
-			fmt.Printf("[taskmaster] Exit code %d is unexpected for program %s (expected: %v)\n", 
-				exitCode, programName, programConfig.ExitCodes)
+			if spv.logger != nil {
+				spv.logger.Debug("Exit code %d is unexpected for program %s (expected: %v)",
+					exitCode, programName, programConfig.ExitCodes)
+			}
 		}
 
 		// A process that exits before startsecs should be considered unexpected
 		// regardless of exit code (supervisor behavior)
 		if !survivedStartsecs {
 			expected = false
-			fmt.Printf("[taskmaster] Process %d marked as unexpected exit (failed startsecs validation)\n", pid)
+			if spv.logger != nil {
+				spv.logger.Debug("Process %d (%s) marked as unexpected exit (failed startsecs validation)", pid, programName)
+			}
 		}
 
 		// Log the exit event
@@ -580,7 +609,9 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	spv.mu.Unlock()
 
 	if manualStop {
-		fmt.Printf("[taskmaster] Program %s (instance %d) was manually stopped, not restarting\n", programName, instanceID)
+		if spv.logger != nil {
+			spv.logger.Info("Program %s (instance %d) was manually stopped, not restarting", programName, instanceID)
+		}
 		spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Process manually stopped")
 		// Remove from tracking since it won't be restarted
 		spv.mu.Lock()
@@ -596,30 +627,42 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	case "always":
 		// Always restart regardless of exit status
 		shouldRestart = true
-		fmt.Printf("[taskmaster] Program %s (instance %d) will be restarted (policy: always)\n", programName, instanceID)
+		if spv.logger != nil {
+			spv.logger.Info("Program %s (instance %d) will be restarted (policy: always)", programName, instanceID)
+		}
 	case "never":
 		// Never restart
 		shouldRestart = false
-		fmt.Printf("[taskmaster] Program %s (instance %d) will not be restarted (policy: never)\n", programName, instanceID)
+		if spv.logger != nil {
+			spv.logger.Info("Program %s (instance %d) will not be restarted (policy: never)", programName, instanceID)
+		}
 	case "unexpected", "":
 		// Restart only on unexpected exits (default behavior if empty)
 		shouldRestart = !expectedExit
 		if shouldRestart {
-			fmt.Printf("[taskmaster] Program %s (instance %d) will be restarted (unexpected exit with code %d)\n", programName, instanceID, exitCode)
+			if spv.logger != nil {
+				spv.logger.Info("Program %s (instance %d) will be restarted (unexpected exit with code %d)", programName, instanceID, exitCode)
+			}
 		} else {
-			fmt.Printf("[taskmaster] Program %s (instance %d) will not be restarted (expected exit with code %d)\n", programName, instanceID, exitCode)
+			if spv.logger != nil {
+				spv.logger.Info("Program %s (instance %d) will not be restarted (expected exit with code %d)", programName, instanceID, exitCode)
+			}
 		}
 	default:
 		// Invalid autorestart value, treat as "never"
 		shouldRestart = false
-		fmt.Printf("[taskmaster] Program %s (instance %d) has invalid autorestart policy '%s', treating as 'never'\n", programName, instanceID, programConfig.Autorestart)
+		if spv.logger != nil {
+			spv.logger.Warn("Program %s (instance %d) has invalid autorestart policy '%s', treating as 'never'", programName, instanceID, programConfig.Autorestart)
+		}
 	}
 
 	if !shouldRestart {
 		// Process exited and won't be restarted - leave it in EXITED state
 		// Don't change state to STOPPED since it wasn't manually stopped
-		fmt.Printf("[taskmaster] Program %s (instance %d) will remain in EXITED state (policy: %s)\n",
-			programName, instanceID, programConfig.Autorestart)
+		if spv.logger != nil {
+			spv.logger.Info("Program %s (instance %d) will remain in EXITED state (policy: %s)",
+				programName, instanceID, programConfig.Autorestart)
+		}
 		spv.mu.Lock()
 		spv.removeProgramInstance(programName, instanceID)
 		spv.mu.Unlock()
@@ -642,8 +685,10 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 
 	// Check if we've exceeded the retry limit
 	if currentRetries >= maxRetries {
-		fmt.Printf("[taskmaster] Program %s (instance %d) has exceeded retry limit (%d), entering FATAL state\n",
-			programName, instanceID, maxRetries)
+		if spv.logger != nil {
+			spv.logger.Warn("Program %s (instance %d) has exceeded retry limit (%d), entering FATAL state",
+				programName, instanceID, maxRetries)
+		}
 		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
 			fmt.Sprintf("Exceeded retry limit (%d attempts)", maxRetries))
 
@@ -667,8 +712,10 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 
 	// Add a small delay before restarting to prevent rapid restart loops
 	restartDelay := 1 * time.Second
-	fmt.Printf("[taskmaster] Restarting program %s (instance %d) in %v (attempt %d/%d)\n",
-		programName, instanceID, restartDelay, currentRetries+1, maxRetries)
+	if spv.logger != nil {
+		spv.logger.Info("Restarting program %s (instance %d) in %v (attempt %d/%d)",
+			programName, instanceID, restartDelay, currentRetries+1, maxRetries)
+	}
 
 	// Update state to indicate restart is pending
 	spv.stateTracker.UpdateState(programName, instanceID, BACKOFF,
@@ -700,9 +747,13 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		spv.programs[programName][instanceID] = newCmd
 		spv.mu.Unlock()
 
-		fmt.Printf("[taskmaster] Successfully restarted program %s (instance %d) with new PID %d\n", programName, instanceID, pid)
+		if spv.logger != nil {
+			spv.logger.Info("Successfully restarted program %s (instance %d) with new PID %d", programName, instanceID, pid)
+		}
 	} else {
-		fmt.Printf("[taskmaster] Failed to restart program %s (instance %d)\n", programName, instanceID)
+		if spv.logger != nil {
+			spv.logger.Error("Failed to restart program %s (instance %d)", programName, instanceID)
+		}
 		// startSingleWorker already handles start failures and sets FATAL state if needed
 		// If startSingleWorker returns nil, the process is already in FATAL state
 	}
@@ -721,13 +772,17 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 	spv.mu.Lock()
 	if spv.manuallyStopped[programName] != nil {
 		delete(spv.manuallyStopped, programName)
-		fmt.Printf("[taskmaster] Cleared manually stopped flags for program %s\n", programName)
+		if spv.logger != nil {
+			spv.logger.Debug("Cleared manually stopped flags for program %s", programName)
+		}
 	}
 
 	// Reset retry counts for manual start - give the program a fresh chance
 	if spv.retryCount[programName] != nil {
 		delete(spv.retryCount, programName)
-		fmt.Printf("[taskmaster] Reset retry counts for program %s (manual start)\n", programName)
+		if spv.logger != nil {
+			spv.logger.Debug("Reset retry counts for program %s (manual start)", programName)
+		}
 	}
 	spv.mu.Unlock()
 
@@ -742,7 +797,9 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 			// Store the command in our tracking map
 			// Key structure: programs[program_name][instance_id] = *exec.Cmd
 			spv.programs[programName][i] = cmd
-			fmt.Printf("[taskmaster] Stored process %d for program %s (instance %d)\n", pid, programName, i)
+			if spv.logger != nil {
+				spv.logger.Debug("Stored process %d for program %s (instance %d)", pid, programName, i)
+			}
 		}
 	}
 }
@@ -843,7 +900,6 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 		signalName = "TERM"
 	}
 
-	fmt.Printf("[taskmaster] Sending signal %s to process %d\n", signalName, pid)
 	if spv.logger != nil {
 		spv.logger.LogProgramStop(programName, pid, signalName)
 	}
@@ -879,7 +935,9 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 	select {
 	case <-time.After(time.Duration(waitSecs) * time.Second):
 		// Timeout expired - process didn't exit gracefully, force kill it
-		fmt.Printf("[taskmaster] Process %d did not exit after %d seconds, killing\n", cmd.Process.Pid, waitSecs)
+		if spv.logger != nil {
+			spv.logger.Warn("Process %d did not exit after %d seconds, sending SIGKILL", cmd.Process.Pid, waitSecs)
+		}
 		err := cmd.Process.Kill() // Send SIGKILL (cannot be ignored)
 		if err != nil {
 			return fmt.Errorf("failed to kill process: %v", err)
@@ -888,7 +946,9 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 		return nil
 	case err := <-done:
 		// Process exited gracefully before timeout
-		fmt.Printf("[taskmaster] Process %d exited after signal\n", cmd.Process.Pid)
+		if spv.logger != nil {
+			spv.logger.Debug("Process %d exited after signal", cmd.Process.Pid)
+		}
 		return err
 	}
 }

@@ -36,12 +36,10 @@ func main() {
 	// Step 4: Log taskmaster startup
 	logger.LogTaskmasterStart(os.Getpid(), configFile)
 
-	// Step 5: Display loaded configuration for verification
-	// This shows what programs were loaded and their basic settings
-	fmt.Println("Config loaded and validated successfully!")
+	// Step 5: Log loaded configuration details
+	logger.Info("Configuration loaded successfully with %d programs", len(cfg.Programs))
 	for name, prog := range cfg.Programs {
-		// Range iterates over the Programs map: name is the key, prog is the Program struct
-		fmt.Printf("Program: %s, Command: %s, NumProcs: %d, ExitCodes: %v\n",
+		logger.Info("Program: %s, Command: %s, NumProcs: %d, ExitCodes: %v",
 			name, prog.Command, prog.NumProcs, prog.ExitCodes)
 	}
 
@@ -56,9 +54,8 @@ func main() {
 	// Step 7: Set up signal handling for reload (SIGHUP) and graceful shutdown (SIGINT/SIGTERM)
 	taskmaster.SetupSignalHandling(supervisor, configFile)
 
-	// Step 8: Display process information
-	// Shows that taskmaster is running and its Process ID (useful for sending signals)
-	fmt.Println("Taskmaster is running. PID:", os.Getpid())
+	// Step 8: Display basic startup confirmation (keep this for user feedback)
+	fmt.Println("Taskmaster started successfully. Use 'help' for available commands.")
 
 	// Step 9: Start the interactive control shell
 	// This provides a command-line interface for managing processes (start, stop, status, etc.)

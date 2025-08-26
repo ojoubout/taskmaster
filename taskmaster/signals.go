@@ -3,7 +3,6 @@
 package taskmaster
 
 import (
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,14 +17,22 @@ func SetupSignalHandling(spv *Supervisor, configFile string) {
 		for sig := range sigs {
 			switch sig {
 			case syscall.SIGHUP:
-				fmt.Println("[taskmaster] Received SIGHUP: reloading configuration")
+				if spv.logger != nil {
+					spv.logger.Info("Received SIGHUP: reloading configuration")
+				}
 				if err := spv.ReloadConfig(configFile); err != nil {
-					fmt.Fprintf(os.Stderr, "[taskmaster] Reload failed: %v\n", err)
+					if spv.logger != nil {
+						spv.logger.Error("Configuration reload failed: %v", err)
+					}
 				} else {
-					fmt.Println("[taskmaster] Configuration reloaded (SIGHUP)")
+					if spv.logger != nil {
+						spv.logger.Info("Configuration reloaded successfully (SIGHUP)")
+					}
 				}
 			case syscall.SIGINT, syscall.SIGTERM:
-				fmt.Printf("[taskmaster] Received %s: initiating shutdown\n", sig.String())
+				if spv.logger != nil {
+					spv.logger.Info("Received %s: initiating shutdown", sig.String())
+				}
 				// Perform graceful shutdown then exit
 				spv.Shutdown()
 				os.Exit(0)
