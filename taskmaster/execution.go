@@ -1,37 +1,30 @@
-// Package taskmaster provides process supervision and execution management
-// This file contains the core supervisor logic and process lifecycle management
 package taskmaster
 
 import (
-	"context" // For handling cancellation and timeouts across goroutines
-	"fmt"     // For formatted I/O operations (printing status messages)
-	"os"      // For file operations and process management
-	"os/exec" // For executing external programs
-	"sort"    // For sorting slices during comparison
-	"strings" // For string manipulation (splitting command arguments)
-	"sync"    // For synchronization primitives (WaitGroup, mutex)
-	"syscall" // For system calls (signals, umask)
-	"time"    // For time-based operations (delays, timeouts)
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
-// Supervisor is the main component that manages all child processes
-// It tracks running programs, handles their lifecycle, and provides control interface
 type Supervisor struct {
-	cfg             *Config                      // Configuration loaded from YAML file
-	programs        map[string]map[int]*exec.Cmd // Map: program_name -> instance_id -> process
-	retryCount      map[string]map[int]int       // Map: program_name -> instance_id -> retry_attempts
-	manuallyStopped map[string]map[int]bool      // Map: program_name -> instance_id -> manually_stopped_flag
-	ctx             context.Context              // Context for cancellation across all goroutines
-	cancel          context.CancelFunc           // Function to cancel the context (stops all goroutines)
-	wg              sync.WaitGroup               // Wait group to track running goroutines
-	mu              sync.RWMutex                 // Read-Write mutex for thread-safe access to programs map
-	logger          *Logger                      // Logger for recording events
-	stateTracker    *StateTracker                // State tracker for comprehensive process monitoring
+	cfg             *Config
+	programs        map[string]map[int]*exec.Cmd
+	retryCount      map[string]map[int]int
+	manuallyStopped map[string]map[int]bool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	mu              sync.RWMutex
+	logger          *Logger
+	stateTracker    *StateTracker
 }
 
-// ---------------- Helper functions to reduce duplication ----------------
-
-// effectiveRetries returns a positive retry count (default 3) for a program.
 func (spv *Supervisor) effectiveRetries(p *Program) int {
 	if p.StartRetries > 0 {
 		return p.StartRetries
@@ -39,7 +32,6 @@ func (spv *Supervisor) effectiveRetries(p *Program) int {
 	return 3
 }
 
-// markProgramInstancesManuallyStopped marks all instances of a program as manually stopped with a reason.
 func (spv *Supervisor) markProgramInstancesManuallyStopped(programName string, processes map[int]*exec.Cmd, reason string) {
 	if processes == nil {
 		return
@@ -55,7 +47,6 @@ func (spv *Supervisor) markProgramInstancesManuallyStopped(programName string, p
 	}
 }
 
-// detachProgram removes a program from tracking and returns its processes snapshot (not thread-safe by itself).
 func (spv *Supervisor) detachProgram(programName string) map[int]*exec.Cmd {
 	processes, ok := spv.programs[programName]
 	if !ok {
@@ -69,7 +60,6 @@ func (spv *Supervisor) detachProgram(programName string) map[int]*exec.Cmd {
 	return snapshot
 }
 
-// removeProgramInstance removes a single instance; cleans program if empty.
 func (spv *Supervisor) removeProgramInstance(programName string, instanceID int) {
 	if inst, ok := spv.programs[programName]; ok {
 		delete(inst, instanceID)
@@ -79,24 +69,20 @@ func (spv *Supervisor) removeProgramInstance(programName string, instanceID int)
 	}
 }
 
-// NewSupervisor creates a new Supervisor instance with the given configuration
-// It initializes the context for cancellation and the programs tracking map
 func NewSupervisor(cfg *Config, logger *Logger) *Supervisor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{
 		cfg:             cfg,
-		programs:        make(map[string]map[int]*exec.Cmd), // Initialize empty programs map
-		retryCount:      make(map[string]map[int]int),       // Initialize retry counter map
-		manuallyStopped: make(map[string]map[int]bool),      // Initialize manually stopped tracking map
+		programs:        make(map[string]map[int]*exec.Cmd),
+		retryCount:      make(map[string]map[int]int),
+		manuallyStopped: make(map[string]map[int]bool),
 		ctx:             ctx,
 		cancel:          cancel,
 		logger:          logger,
-		stateTracker:    NewStateTracker(logger), // Initialize state tracker
+		stateTracker:    NewStateTracker(logger),
 	}
 }
 
-// ReloadConfig reloads the configuration from file, applies differences (add, remove, restart changed)
-// and leaves unchanged programs running. It mirrors supervisorctl reload behavior.
 func (spv *Supervisor) ReloadConfig(configFile string) error {
 	newCfg, err := LoadConfig(configFile)
 	if err != nil {
@@ -106,13 +92,11 @@ func (spv *Supervisor) ReloadConfig(configFile string) error {
 		return err
 	}
 
-	// Swap config under lock quickly
 	spv.mu.Lock()
 	oldCfg := spv.cfg
 	spv.cfg = newCfg
 	spv.mu.Unlock()
 
-	// Apply changes without holding lock
 	spv.applyConfigChanges(oldCfg, newCfg)
 
 	if spv.logger != nil {
@@ -121,10 +105,7 @@ func (spv *Supervisor) ReloadConfig(configFile string) error {
 	return nil
 }
 
-// applyConfigChanges compares old and new configs and applies lifecycle changes.
-// Removed programs are stopped (no autorestart), changed programs are restarted, new autostart ones are started.
 func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
-	// Removed programs
 	for name := range oldCfg.Programs {
 		if _, exists := newCfg.Programs[name]; exists {
 			continue
@@ -143,8 +124,6 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 			}
 		}
 	}
-
-	// New & changed programs
 	for name, newProgram := range newCfg.Programs {
 		oldProgram, existed := oldCfg.Programs[name]
 		if !existed {
@@ -176,11 +155,6 @@ func (spv *Supervisor) applyConfigChanges(oldCfg, newCfg *Config) {
 	}
 }
 
-// programsEqual compares critical fields to decide if a program definition changed
-// programsEqual determines if two program definitions are effectively identical
-// for purposes of deciding whether a running program must be restarted after a reload.
-// We include all fields that influence runtime behavior (mirroring supervisor's restart-on-change)
-// Excluded fields (if any) would be those that do not affect the already running process—currently none.
 func programsEqual(p1, p2 Program) bool {
 	if p1.Command != p2.Command ||
 		p1.NumProcs != p2.NumProcs ||
@@ -197,7 +171,6 @@ func programsEqual(p1, p2 Program) bool {
 		return false
 	}
 
-	// Compare ExitCodes ignoring order
 	if len(p1.ExitCodes) != len(p2.ExitCodes) {
 		return false
 	}
@@ -211,7 +184,6 @@ func programsEqual(p1, p2 Program) bool {
 		}
 	}
 
-	// Compare environment maps (size + each key/value)
 	if len(p1.Env) != len(p2.Env) {
 		return false
 	}
@@ -223,7 +195,6 @@ func programsEqual(p1, p2 Program) bool {
 	return true
 }
 
-// Shutdown gracefully stops all running programs and waits for goroutines.
 func (spv *Supervisor) Shutdown() {
 	if spv.logger != nil {
 		spv.logger.Info("Graceful shutdown initiated")
@@ -250,57 +221,42 @@ func (spv *Supervisor) Shutdown() {
 		}
 	}
 
-	// Cancel context and wait for monitor goroutines
 	spv.cancel()
 	spv.wg.Wait()
 	if spv.logger != nil {
 		spv.logger.LogTaskmasterStop()
 		spv.logger.Close()
 	}
-	// Keep this print as it's final user confirmation
 	fmt.Println("[taskmaster] Shutdown complete")
 }
 
-// startSingleWorker creates and starts a single process instance
-// This is the core function that actually executes programs and sets up monitoring
-// Returns: PID of started process, the *exec.Cmd for management, and program name
 func startSingleWorker(programName string, programConfig *Program, instanceID int, spv *Supervisor) (int, *exec.Cmd) {
-	// Update state to STARTING
 	spv.stateTracker.UpdateState(programName, instanceID, STARTING, "Attempting to start process")
 
-	// Step 1: Parse command string into program and arguments
-	// Example: "/bin/sleep 10" becomes ["/bin/sleep", "10"]
 	parts := strings.Fields(programConfig.Command)
 	cmd := exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
 
-	// Step 2: Set working directory if specified
 	if programConfig.Directory != "" {
 		cmd.Dir = programConfig.Directory
 	}
 
-	// Step 3: Set up environment variables
-	// Start with system environment and add custom variables from config
-	env := os.Environ() // Get current environment
+	env := os.Environ()
 	for k, v := range programConfig.Env {
-		env = append(env, k+"="+v) // Add each custom env var
+		env = append(env, k+"="+v)
 	}
 	cmd.Env = env
 
-	// Step 4: Set up stdout redirection if specified
 	if programConfig.Stdout != "" {
-		// Open file with create, write-only, append flags
-		// 0644 means readable by owner/group/others, writable by owner only
 		stdoutFile, err := os.OpenFile(programConfig.Stdout, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			if spv.logger != nil {
 				spv.logger.Error("Failed to open stdout file %s: %v", programConfig.Stdout, err)
 			}
 		} else {
-			cmd.Stdout = stdoutFile // Redirect process stdout to file
+			cmd.Stdout = stdoutFile
 		}
 	}
 
-	// Step 5: Set up stderr redirection (same pattern as stdout)
 	if programConfig.Stderr != "" {
 		stderrFile, err := os.OpenFile(programConfig.Stderr, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -308,32 +264,26 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				spv.logger.Error("Failed to open stderr file %s: %v", programConfig.Stderr, err)
 			}
 		} else {
-			cmd.Stderr = stderrFile // Redirect process stderr to file
+			cmd.Stderr = stderrFile
 		}
 	}
 
-	// Step 6: Set umask (file permission mask) if specified
 	var oldUmask int
 	if programConfig.Umask != 0 {
-		oldUmask = syscall.Umask(programConfig.Umask) // Set new umask, save old one
-		defer syscall.Umask(oldUmask)                 // Restore old umask when function returns
+		oldUmask = syscall.Umask(programConfig.Umask)
+		defer syscall.Umask(oldUmask)
 	}
 
-	// Log program startup - this is already done in LogProgramStart, so remove this print
-
-	// Step 7: Actually start the process with retry logic
 	maxStartRetries := spv.effectiveRetries(programConfig)
 
 	var err error
 	var startAttempt int
 
 	for startAttempt = 1; startAttempt <= maxStartRetries; startAttempt++ {
-		// Create a fresh command for each attempt
 		if startAttempt > 1 {
 			parts := strings.Fields(programConfig.Command)
 			cmd = exec.CommandContext(spv.ctx, parts[0], parts[1:]...)
 
-			// Re-apply all the configuration for retry attempts
 			if programConfig.Directory != "" {
 				cmd.Dir = programConfig.Directory
 			}
@@ -374,11 +324,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 
 		err = cmd.Start()
 		if err == nil {
-			// Success! Break out of retry loop
 			break
 		}
 
-		// Log the failed attempt
 		if spv.logger != nil {
 			spv.logger.LogStartupFailure(programName, startAttempt, maxStartRetries, err)
 		}
@@ -409,25 +357,21 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		}
 	}
 
-	// Check if all attempts failed
 	if err != nil {
 		if spv.logger != nil {
 			spv.logger.Error("Failed to start %s after %d attempts, giving up", programConfig.Command, maxStartRetries)
 		}
 		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
 			fmt.Sprintf("Failed to start after %d attempts: %v", maxStartRetries, err))
-		return 0, nil // Return 0 PID and nil cmd to indicate failure
+		return 0, nil
 	}
 
-	// Step 8: Get the PID and log success
 	pid := cmd.Process.Pid
 	if spv.logger != nil {
 		spv.logger.LogProgramStart(programName, pid, programConfig.Command)
 	}
 
-	// Update state tracker with successful start - but keep in STARTING state until startsecs validation
 	spv.stateTracker.SetPID(programName, instanceID, pid)
-	// Always start in STARTING state - the monitoring goroutine will transition to RUNNING
 	if programConfig.StartSecs > 0 {
 		spv.stateTracker.UpdateState(programName, instanceID, STARTING,
 			fmt.Sprintf("Started, checking for %d seconds", programConfig.StartSecs))
@@ -437,10 +381,9 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 	}
 
 	// Step 9: Define cleanup function for file handles
-	// This ensures files are properly closed when process ends
 	closeFiles := func() {
 		if cmd.Stdout != nil {
-			if file, ok := cmd.Stdout.(*os.File); ok { // Type assertion to check if it's a file
+			if file, ok := cmd.Stdout.(*os.File); ok {
 				file.Close()
 			}
 		}
@@ -451,25 +394,19 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 		}
 	}
 
-	// Step 10: Start monitoring goroutine
-	// This runs concurrently to monitor the process lifecycle
-	spv.wg.Add(1) // Add to wait group so we can wait for all goroutines to finish
+	spv.wg.Add(1)
 	go func() {
-		defer spv.wg.Done() // Mark this goroutine as done when it exits
-		defer closeFiles()  // Ensure files are closed when goroutine exits
+		defer spv.wg.Done()
+		defer closeFiles()
 
-		// Step 10a: Handle startsecs validation
-		// The process must run for at least startsecs to be considered "successfully started"
-		// In supervisor, processes that exit before startsecs are considered unexpected exits
 		var processExitErr error
-		var survivedStartsecs bool = true // Track if process survived startsecs
+		var survivedStartsecs bool = true
 
 		if programConfig.StartSecs > 0 {
 			if spv.logger != nil {
 				spv.logger.Debug("Process %d (%s) must run for %d seconds to be considered started", pid, programName, programConfig.StartSecs)
 			}
 
-			// Create channels for communication between goroutines
 			processExited := make(chan struct{})
 			startupTimer := time.NewTimer(time.Duration(programConfig.StartSecs) * time.Second)
 			defer startupTimer.Stop()
@@ -480,52 +417,41 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				close(processExited)
 			}()
 
-			// Race between startup timer and process exit
 			select {
 			case <-spv.ctx.Done():
-				// Supervisor is shutting down, exit
 				return
 			case <-startupTimer.C:
-				// Timer expired - process survived startsecs
 				if spv.logger != nil {
 					spv.logger.Debug("Process %d (%s) survived startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
 				}
 
-				// Update state to confirm running status after startsecs validation
 				spv.stateTracker.UpdateState(programName, instanceID, RUNNING,
 					"Process started successfully")
 
-				// Now wait for the process to actually exit
 				<-processExited
 			case <-processExited:
-				// Process exited before startsecs - this should be considered unexpected
 				survivedStartsecs = false
 				if spv.logger != nil {
 					spv.logger.Warn("Process %d (%s) exited before startsecs validation (%d seconds)", pid, programName, programConfig.StartSecs)
 				}
 
-				// Update state to indicate early exit
 				spv.stateTracker.UpdateState(programName, instanceID, EXITED,
 					fmt.Sprintf("Process exited before %d second startup validation", programConfig.StartSecs))
 			}
 		} else {
-			// No startsecs validation required - transition to RUNNING after brief STARTING state
 			if spv.logger != nil {
 				spv.logger.Debug("Process %d (%s) started (no startsecs validation)", pid, programName)
 			}
 			spv.stateTracker.UpdateState(programName, instanceID, RUNNING,
 				"Process started successfully")
 
-			// Wait for process to exit
 			processExitErr = cmd.Wait()
 		}
 
-		// Step 10b: Process has exited, handle the exit
 		err = processExitErr
 
-		// Determine exit code and whether it was expected
 		exitCode := 0
-		expected := false // Default to false, must be proven expected
+		expected := false
 
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
@@ -542,7 +468,6 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			}
 		}
 
-		// ALWAYS check if this exit code is in the expected list
 		for _, expectedCode := range programConfig.ExitCodes {
 			if exitCode == expectedCode {
 				expected = true
@@ -561,8 +486,6 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			}
 		}
 
-		// A process that exits before startsecs should be considered unexpected
-		// regardless of exit code (supervisor behavior)
 		if !survivedStartsecs {
 			expected = false
 			if spv.logger != nil {
@@ -570,12 +493,10 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 			}
 		}
 
-		// Log the exit event
 		if spv.logger != nil {
 			spv.logger.LogProgramExit(programName, pid, exitCode, expected)
 		}
 
-		// Update state tracker with exit information
 		spv.stateTracker.SetExitStatus(programName, instanceID, exitCode, expected)
 		if expected {
 			spv.stateTracker.UpdateState(programName, instanceID, EXITED,
@@ -585,22 +506,16 @@ func startSingleWorker(programName string, programConfig *Program, instanceID in
 				fmt.Sprintf("Process exited unexpectedly with code %d", exitCode))
 		}
 
-		// Step 10c: Handle restart logic based on autorestart policy
-		// Note: startsecs doesn't prevent restarts in supervisor
 		spv.handleProcessRestart(programName, programConfig, instanceID, expected, exitCode)
 	}()
 
-	return pid, cmd // Return PID and command for tracking
+	return pid, cmd
 }
 
-// handleProcessRestart determines if and how to restart a process based on autorestart policy
-// This implements the core autorestart functionality according to supervisor behavior
 func (spv *Supervisor) handleProcessRestart(programName string, programConfig *Program, instanceID int, expectedExit bool, exitCode int) {
-	// Check if this process was manually stopped
 	spv.mu.Lock()
 	manualStop := spv.manuallyStopped[programName][instanceID]
 	if manualStop {
-		// Clean up the manually stopped flag since process has exited
 		delete(spv.manuallyStopped[programName], instanceID)
 		if len(spv.manuallyStopped[programName]) == 0 {
 			delete(spv.manuallyStopped, programName)
@@ -637,7 +552,6 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 			spv.logger.Info("Program %s (instance %d) will not be restarted (policy: never)", programName, instanceID)
 		}
 	case "unexpected", "":
-		// Restart only on unexpected exits (default behavior if empty)
 		shouldRestart = !expectedExit
 		if shouldRestart {
 			if spv.logger != nil {
@@ -649,7 +563,6 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 			}
 		}
 	default:
-		// Invalid autorestart value, treat as "never"
 		shouldRestart = false
 		if spv.logger != nil {
 			spv.logger.Warn("Program %s (instance %d) has invalid autorestart policy '%s', treating as 'never'", programName, instanceID, programConfig.Autorestart)
@@ -657,8 +570,6 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 	}
 
 	if !shouldRestart {
-		// Process exited and won't be restarted - leave it in EXITED state
-		// Don't change state to STOPPED since it wasn't manually stopped
 		if spv.logger != nil {
 			spv.logger.Info("Program %s (instance %d) will remain in EXITED state (policy: %s)",
 				programName, instanceID, programConfig.Autorestart)
@@ -669,21 +580,18 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		return
 	}
 
-	// Initialize retry tracking if needed
 	spv.mu.Lock()
 	if spv.retryCount[programName] == nil {
 		spv.retryCount[programName] = make(map[int]int)
 	}
 
-	// Check current retry count for this instance
 	currentRetries := spv.retryCount[programName][instanceID]
 	maxRetries := programConfig.StartRetries
 	if maxRetries <= 0 {
-		maxRetries = 3 // Default retry count
+		maxRetries = 3
 	}
 	spv.mu.Unlock()
 
-	// Check if we've exceeded the retry limit
 	if currentRetries >= maxRetries {
 		if spv.logger != nil {
 			spv.logger.Warn("Program %s (instance %d) has exceeded retry limit (%d), entering FATAL state",
@@ -692,7 +600,6 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		spv.stateTracker.UpdateState(programName, instanceID, FATAL,
 			fmt.Sprintf("Exceeded retry limit (%d attempts)", maxRetries))
 
-		// Remove from tracking since it won't be restarted
 		spv.mu.Lock()
 		spv.removeProgramInstance(programName, instanceID)
 		if spv.retryCount[programName] != nil {
@@ -705,41 +612,32 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		return
 	}
 
-	// Increment retry count for this restart attempt
 	spv.mu.Lock()
 	spv.retryCount[programName][instanceID] = currentRetries + 1
 	spv.mu.Unlock()
 
-	// Add a small delay before restarting to prevent rapid restart loops
 	restartDelay := 1 * time.Second
 	if spv.logger != nil {
 		spv.logger.Info("Restarting program %s (instance %d) in %v (attempt %d/%d)",
 			programName, instanceID, restartDelay, currentRetries+1, maxRetries)
 	}
 
-	// Update state to indicate restart is pending
 	spv.stateTracker.UpdateState(programName, instanceID, BACKOFF,
 		fmt.Sprintf("Waiting %v before restart (attempt %d/%d)", restartDelay, currentRetries+1, maxRetries))
 
-	// Log the restart attempt
 	if spv.logger != nil {
 		spv.logger.LogProgramRestart(programName, "autorestart")
 	}
 
-	// Wait before restarting
 	select {
 	case <-spv.ctx.Done():
-		// Supervisor is shutting down, don't restart
 		spv.stateTracker.UpdateState(programName, instanceID, STOPPED, "Supervisor shutting down")
 		return
 	case <-time.After(restartDelay):
-		// Delay completed, proceed with restart
 	}
 
-	// Start the replacement process
 	pid, newCmd := startSingleWorker(programName, programConfig, instanceID, spv)
 	if newCmd != nil {
-		// Update the tracking map with the new process
 		spv.mu.Lock()
 		if spv.programs[programName] == nil {
 			spv.programs[programName] = make(map[int]*exec.Cmd)
@@ -754,21 +652,14 @@ func (spv *Supervisor) handleProcessRestart(programName string, programConfig *P
 		if spv.logger != nil {
 			spv.logger.Error("Failed to restart program %s (instance %d)", programName, instanceID)
 		}
-		// startSingleWorker already handles start failures and sets FATAL state if needed
-		// If startSingleWorker returns nil, the process is already in FATAL state
 	}
 }
 
-// StartProgram starts all instances of a program according to its numprocs setting
-// This is called by the shell when user types "start program_name"
 func (spv *Supervisor) StartProgram(programName string, programConfig *Program) {
-	// Initialize the program's process map if it doesn't exist
 	if spv.programs[programName] == nil {
 		spv.programs[programName] = make(map[int]*exec.Cmd)
 	}
 
-	// Clear any manually stopped flags for this program since we're starting it manually
-	// This allows autorestart to work again after manual start
 	spv.mu.Lock()
 	if spv.manuallyStopped[programName] != nil {
 		delete(spv.manuallyStopped, programName)
@@ -777,7 +668,6 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 		}
 	}
 
-	// Reset retry counts for manual start - give the program a fresh chance
 	if spv.retryCount[programName] != nil {
 		delete(spv.retryCount, programName)
 		if spv.logger != nil {
@@ -805,20 +695,15 @@ func (spv *Supervisor) StartProgram(programName string, programConfig *Program) 
 }
 
 // RunInitialState starts all programs that have autostart=true
-// This is called when taskmaster first starts up
 func RunInitialState(spv *Supervisor) {
-	// Iterate through all configured programs
 	for name, programConfig := range spv.cfg.Programs {
 		if !programConfig.Autostart {
-			continue // Skip programs that shouldn't auto-start
+			continue
 		}
-		// Start programs with autostart=true
 		spv.StartProgram(name, &programConfig)
 	}
 }
 
-// StopProgram stops all instances of a program
-// This is called by the shell when user types "stop program_name"
 func (spv *Supervisor) StopProgram(programName string, programConfig *Program) error {
 	processes, running := spv.programs[programName]
 	if !running || len(processes) == 0 {
@@ -840,27 +725,22 @@ func (spv *Supervisor) StopProgram(programName string, programConfig *Program) e
 	return nil
 }
 
-// GetProcessState returns the current state of a specific process instance
 func (spv *Supervisor) GetProcessState(programName string, instanceID int) (*ProcessInfo, bool) {
 	return spv.stateTracker.GetProcessInfo(programName, instanceID)
 }
 
-// GetAllProcessStates returns the current state of all tracked processes
 func (spv *Supervisor) GetAllProcessStates() map[string]*ProcessInfo {
 	return spv.stateTracker.GetAllProcesses()
 }
 
-// GetProgramStates returns all instances of a specific program
 func (spv *Supervisor) GetProgramStates(programName string) []*ProcessInfo {
 	return spv.stateTracker.GetProcessesByName(programName)
 }
 
-// IsProcessRunning checks if a specific process instance is running
 func (spv *Supervisor) IsProcessRunning(programName string, instanceID int) bool {
 	return spv.stateTracker.IsProcessRunning(programName, instanceID)
 }
 
-// GetRunningCount returns the number of running instances for a program
 func (spv *Supervisor) GetRunningCount(programName string) int {
 	return spv.stateTracker.GetRunningCount(programName)
 }
@@ -868,32 +748,28 @@ func (spv *Supervisor) GetRunningCount(programName string) int {
 // StopProcess gracefully stops a process using the configured stop signal
 // If the process doesn't exit within stopwaitsecs, it sends SIGKILL
 func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programConfig *Program) error {
-	// Validate that we have a running process to stop
 	if cmd == nil || cmd.Process == nil {
 		return fmt.Errorf("process not running")
 	}
 
-	// Step 1: Parse the stop signal from string to syscall.Signal
-	// Default to SIGTERM if not specified or invalid
-	sig := syscall.SIGTERM // Default signal
+	sig := syscall.SIGTERM
 	switch programConfig.StopSignal {
 	case "HUP":
-		sig = syscall.SIGHUP // Hangup signal
+		sig = syscall.SIGHUP
 	case "INT":
-		sig = syscall.SIGINT // Interrupt signal (Ctrl+C)
+		sig = syscall.SIGINT
 	case "QUIT":
-		sig = syscall.SIGQUIT // Quit signal (Ctrl+\)
+		sig = syscall.SIGQUIT
 	case "KILL":
-		sig = syscall.SIGKILL // Kill signal (cannot be caught)
+		sig = syscall.SIGKILL
 	case "USR1":
-		sig = syscall.SIGUSR1 // User-defined signal 1
+		sig = syscall.SIGUSR1
 	case "USR2":
-		sig = syscall.SIGUSR2 // User-defined signal 2
+		sig = syscall.SIGUSR2
 	case "TERM":
-		sig = syscall.SIGTERM // Termination signal (default)
+		sig = syscall.SIGTERM
 	}
 
-	// Step 2: Send the stop signal to the process
 	pid := cmd.Process.Pid
 	signalName := programConfig.StopSignal
 	if signalName == "" {
@@ -909,43 +785,35 @@ func (spv *Supervisor) StopProcess(cmd *exec.Cmd, programName string, programCon
 		return fmt.Errorf("failed to send signal: %v", err)
 	}
 
-	// Step 3: Wait for process to exit gracefully, with timeout
 	waitSecs := programConfig.StopWaitSecs
 	if waitSecs <= 0 {
-		waitSecs = 5 // Default wait time if not specified
+		waitSecs = 5
 	}
 
-	// Use a goroutine to wait for process exit
 	done := make(chan error, 1)
 	go func() {
-		// Poll the process to see if it's still running instead of calling Wait()
-		// since the monitoring goroutine is already calling Wait()
 		for {
 			err := cmd.Process.Signal(syscall.Signal(0))
 			if err != nil {
-				// Process no longer exists
 				done <- nil
 				return
 			}
-			time.Sleep(100 * time.Millisecond) // Check every 100ms
+			time.Sleep(100 * time.Millisecond)
 		}
 	}()
 
-	// Step 4: Race between timeout and process exit
 	select {
 	case <-time.After(time.Duration(waitSecs) * time.Second):
-		// Timeout expired - process didn't exit gracefully, force kill it
 		if spv.logger != nil {
 			spv.logger.Warn("Process %d did not exit after %d seconds, sending SIGKILL", cmd.Process.Pid, waitSecs)
 		}
-		err := cmd.Process.Kill() // Send SIGKILL (cannot be ignored)
+		err := cmd.Process.Kill()
 		if err != nil {
 			return fmt.Errorf("failed to kill process: %v", err)
 		}
-		<-done // Wait for the Wait() call to complete
+		<-done
 		return nil
 	case err := <-done:
-		// Process exited gracefully before timeout
 		if spv.logger != nil {
 			spv.logger.Debug("Process %d exited after signal", cmd.Process.Pid)
 		}

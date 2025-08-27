@@ -12,14 +12,14 @@ import (
 type ProcessState int
 
 const (
-	STOPPED  ProcessState = iota // Process is not running
-	STARTING                     // Process is starting up
-	RUNNING                      // Process is running normally
-	BACKOFF                      // Process failed to start and is backing off before retry
-	STOPPING                     // Process is in the process of stopping
-	EXITED                       // Process exited normally (expected exit code)
-	FATAL                        // Process failed to start after max retries or unexpected exit
-	UNKNOWN                      // Process state is unknown
+	STOPPED ProcessState = iota
+	STARTING
+	RUNNING
+	BACKOFF
+	STOPPING
+	EXITED
+	FATAL
+	UNKNOWN
 )
 
 // String returns the string representation of the process state
@@ -46,28 +46,28 @@ func (s ProcessState) String() string {
 
 // ProcessInfo holds detailed information about a process instance
 type ProcessInfo struct {
-	Name         string        `json:"name"`          // Program name
-	InstanceID   int           `json:"instance_id"`   // Instance ID for programs with numprocs > 1
-	Group        string        `json:"group"`         // Process group name
-	State        ProcessState  `json:"state"`         // Current state
-	Description  string        `json:"description"`   // Human-readable state description
-	PID          int           `json:"pid"`           // Process ID (0 if not running)
-	Uptime       time.Duration `json:"uptime"`        // How long the process has been running
-	StartTime    time.Time     `json:"start_time"`    // When the process was started
-	StopTime     time.Time     `json:"stop_time"`     // When the process was stopped
-	ExitStatus   int           `json:"exit_status"`   // Exit code from last run
-	Retries      int           `json:"retries"`       // Current retry count
-	MaxRetries   int           `json:"max_retries"`   // Maximum allowed retries
-	AutoRestart  string        `json:"auto_restart"`  // Restart policy
-	ExpectedExit bool          `json:"expected_exit"` // Whether the exit was expected
-	mu           sync.RWMutex  // Mutex for thread-safe access
+	Name         string        `json:"name"`
+	InstanceID   int           `json:"instance_id"`
+	Group        string        `json:"group"`
+	State        ProcessState  `json:"state"`
+	Description  string        `json:"description"`
+	PID          int           `json:"pid"`
+	Uptime       time.Duration `json:"uptime"`
+	StartTime    time.Time     `json:"start_time"`
+	StopTime     time.Time     `json:"stop_time"`
+	ExitStatus   int           `json:"exit_status"`
+	Retries      int           `json:"retries"`
+	MaxRetries   int           `json:"max_retries"`
+	AutoRestart  string        `json:"auto_restart"`
+	ExpectedExit bool          `json:"expected_exit"`
+	mu           sync.RWMutex
 }
 
 // StateTracker manages process states across all programs and instances
 type StateTracker struct {
-	processes map[string]*ProcessInfo // Map: "program_name:instance_id" -> ProcessInfo
-	mu        sync.RWMutex            // Mutex for thread-safe access to processes map
-	logger    *Logger                 // Logger for state change events
+	processes map[string]*ProcessInfo
+	mu        sync.RWMutex
+	logger    *Logger
 }
 
 // NewStateTracker creates a new state tracker instance

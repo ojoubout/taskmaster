@@ -3,20 +3,20 @@
 package taskmaster
 
 import (
-	"fmt"      // For formatted string operations
-	"log"      // For standard logging functionality
-	"os"       // For file operations
-	"sync"     // For synchronization primitives (mutex for thread safety)
+	"fmt"
+	"log"
+	"os"
+	"sync"
 )
 
 // LogLevel represents different levels of logging
 type LogLevel int
 
 const (
-	LogLevelInfo LogLevel = iota  // General information messages
-	LogLevelWarn                  // Warning messages
-	LogLevelError                 // Error messages
-	LogLevelDebug                 // Debug messages (detailed information)
+	LogLevelInfo LogLevel = iota
+	LogLevelWarn
+	LogLevelError
+	LogLevelDebug
 )
 
 // String returns the string representation of a log level
@@ -35,27 +35,21 @@ func (l LogLevel) String() string {
 	}
 }
 
-// Logger represents the logging system for taskmaster
-// It provides thread-safe logging to a file with different log levels
+// Logger provides thread-safe logging to a file with different log levels
 type Logger struct {
-	file     *os.File     // File handle for the log file
-	logger   *log.Logger  // Standard library logger for formatting
-	mu       sync.Mutex   // Mutex for thread-safe writing
-	logLevel LogLevel     // Minimum log level to write
+	file     *os.File
+	logger   *log.Logger
+	mu       sync.Mutex
+	logLevel LogLevel
 }
 
 // NewLogger creates a new Logger instance that writes to the specified file
-// If the file doesn't exist, it will be created. If it exists, logs will be appended.
 func NewLogger(logPath string, level LogLevel) (*Logger, error) {
-	// Open or create the log file with append mode
-	// 0644 means readable by owner/group/others, writable by owner only
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file %s: %v", logPath, err)
 	}
 
-	// Create a standard library logger that writes to our file
-	// The flags control the format: date, time, and microseconds
 	logger := log.New(file, "", log.LstdFlags|log.Lmicroseconds)
 
 	return &Logger{
@@ -66,11 +60,10 @@ func NewLogger(logPath string, level LogLevel) (*Logger, error) {
 }
 
 // Close closes the log file handle
-// This should be called when the logger is no longer needed
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	
+
 	if l.file != nil {
 		return l.file.Close()
 	}
@@ -78,9 +71,7 @@ func (l *Logger) Close() error {
 }
 
 // log is the internal logging method that handles the actual writing
-// It checks the log level and formats the message appropriately
 func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
-	// Only log if the message level is at or above our configured level
 	if level < l.logLevel {
 		return
 	}
@@ -88,32 +79,23 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Format the message with the provided arguments
 	message := fmt.Sprintf(format, args...)
-	
-	// Create the full log entry with level prefix
 	logEntry := fmt.Sprintf("[%s] %s", level.String(), message)
-	
-	// Write to the log file using the standard logger
 	l.logger.Println(logEntry)
 }
 
-// Info logs an informational message
 func (l *Logger) Info(format string, args ...interface{}) {
 	l.log(LogLevelInfo, format, args...)
 }
 
-// Warn logs a warning message
 func (l *Logger) Warn(format string, args ...interface{}) {
 	l.log(LogLevelWarn, format, args...)
 }
 
-// Error logs an error message
 func (l *Logger) Error(format string, args ...interface{}) {
 	l.log(LogLevelError, format, args...)
 }
 
-// Debug logs a debug message
 func (l *Logger) Debug(format string, args ...interface{}) {
 	l.log(LogLevelDebug, format, args...)
 }
