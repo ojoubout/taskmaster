@@ -1,0 +1,64 @@
+// Package main is the entry point for the taskmaster application
+// Taskmaster is a job control daemon (process supervisor) similar to supervisord
+package main
+
+import (
+	"fmt"                   // For formatted I/O operations (printing)
+	"os"                    // For operating system interface (file operations, exit codes)
+	"taskmaster/taskmaster" // Import our custom taskmaster package
+)
+
+func main() {
+	// Step 1: Parse command line arguments for config file
+	configFile := "taskmaster.conf" // Default config file
+	if len(os.Args) > 1 {
+		configFile = os.Args[1] // Use first argument as config file if provided
+	}
+
+	// Step 2: Load and parse configuration file
+	// LoadConfig reads the specified config file (YAML format) and validates all settings
+	cfg, err := taskmaster.LoadConfig(configFile)
+	if err != nil {
+		// If config loading fails, print error to stderr and exit with status 1
+		fmt.Fprintln(os.Stderr, "Error loading config:", err)
+		os.Exit(1)
+	}
+
+	// Step 3: Initialize the logging system
+	// Create a logger that writes to taskmaster.log with INFO level
+	logger, err := taskmaster.NewLogger("taskmaster.log", taskmaster.LogLevelInfo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error creating logger:", err)
+		os.Exit(1)
+	}
+	defer logger.Close() // Ensure logger is closed when main exits
+
+	// Step 4: Log taskmaster startup
+	logger.LogTaskmasterStart(os.Getpid(), configFile)
+
+	// Step 5: Log loaded configuration details
+	logger.Info("Configuration loaded successfully with %d programs", len(cfg.Programs))
+	for name, prog := range cfg.Programs {
+		logger.Info("Program: %s, Command: %s, NumProcs: %d, ExitCodes: %v",
+			name, prog.Command, prog.NumProcs, prog.ExitCodes)
+	}
+
+	// Step 5: Create the supervisor instance with logger
+	// The supervisor is the core component that manages all child processes
+	supervisor := taskmaster.NewSupervisor(cfg, logger)
+
+	// Step 6: Start initial programs that have autostart=true
+	// This goes through all programs and starts the ones configured to auto-start
+	taskmaster.RunInitialState(supervisor)
+
+	// Step 7: Set up signal handling for reload (SIGHUP) and graceful shutdown (SIGINT/SIGTERM)
+	taskmaster.SetupSignalHandling(supervisor, configFile)
+
+	// Step 8: Display basic startup confirmation (keep this for user feedback)
+	fmt.Println("Taskmaster started successfully. Use 'help' for available commands.")
+
+	// Step 9: Start the interactive control shell
+	// This provides a command-line interface for managing processes (start, stop, status, etc.)
+	shell := taskmaster.NewShell(supervisor, configFile)
+	shell.Start() // This blocks and runs the interactive shell until user quits
+}
